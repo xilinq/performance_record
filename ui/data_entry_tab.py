@@ -3,6 +3,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdi
                                QTableWidget, QTableWidgetItem, QPushButton, QComboBox,
                                QSpinBox, QTextEdit, QMessageBox, QHeaderView, QTabWidget)
 from PyQt5.QtCore import QDate, Qt
+from rename_person_dialog import RenamePersonDialog
 
 class DataEntryTab(QWidget):
     def __init__(self, db_manager):
@@ -206,13 +207,36 @@ class DataEntryTab(QWidget):
             }
         """)
         person_mgmt_layout.addWidget(self.add_person_button)
+        
+        # 修改人名按钮
+        self.rename_person_button = QPushButton("修改人名")
+        self.rename_person_button.clicked.connect(self.open_rename_dialog)
+        self.rename_person_button.setMinimumWidth(100)
+        self.rename_person_button.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db;
+                color: white;
+                border: none;
+                padding: 6px 12px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #2980b9;
+            }
+            QPushButton:pressed {
+                background-color: #21618c;
+            }
+        """)
+        person_mgmt_layout.addWidget(self.rename_person_button)
+        
         person_mgmt_layout.addStretch()
         
         layout.addLayout(person_mgmt_layout)
 
         # 4. 添加行/删除行按钮
         table_actions_layout = QHBoxLayout()
-        self.add_row_button = QPushButton("添加人员")
+        self.add_row_button = QPushButton("添加记录")
         self.add_row_button.clicked.connect(self.add_row)
         self.add_row_button.setMinimumWidth(100)
         self.add_row_button.setStyleSheet("""
@@ -664,6 +688,31 @@ class DataEntryTab(QWidget):
             self.refresh_name_combos()
         else:
             QMessageBox.critical(self, "添加失败", f"添加人员 '{new_name}' 失败")
+
+    def open_rename_dialog(self):
+        """打开修改人名对话框"""
+        try:
+            # 导入重命名对话框类
+            try:
+                from rename_person_dialog import RenamePersonDialog
+            except ImportError:
+                from ui.rename_person_dialog import RenamePersonDialog
+            
+            # 创建对话框实例
+            dialog = RenamePersonDialog(self, self.db)
+            
+            # 显示对话框并等待用户操作
+            if dialog.exec_() == dialog.Accepted:
+                # 如果重命名成功，刷新UI
+                if dialog.result:
+                    # 刷新当前表格数据
+                    self.load_period_data()
+                    # 刷新所有姓名下拉框
+                    self.refresh_name_combos()
+                    # 刷新按人员管理标签页中的人员下拉列表
+                    self.refresh_person_list()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"打开修改人名对话框失败：{e}")
 
     def refresh_name_combos(self):
         """刷新表格中所有姓名下拉框"""

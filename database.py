@@ -115,6 +115,53 @@ class DatabaseManager:
         self.cursor.execute("UPDATE all_names SET is_active = 1 WHERE name = ?", (name,))
         self.conn.commit()
 
+    def rename_person(self, old_name, new_name):
+        """重命名人员，将数据库中所有出现的旧名字替换为新名字"""
+        if not old_name or not new_name:
+            return False
+        
+        old_name = old_name.strip()
+        new_name = new_name.strip()
+        
+        if old_name == new_name:
+            return True  # 名字相同，无需操作
+        
+        try:
+            # 1. 更新performance表中的所有记录
+            self.cursor.execute("""
+                UPDATE performance 
+                SET name = ? 
+                WHERE name = ?
+            """, (new_name, old_name))
+            
+            # 2. 更新all_names表
+            # 首先检查新名字是否已存在
+            self.cursor.execute("SELECT COUNT(*) FROM all_names WHERE name = ?", (new_name,))
+            if self.cursor.fetchone()[0] == 0:
+                # 新名字不存在，则重命名
+                self.cursor.execute("""
+                    UPDATE all_names 
+                    SET name = ? 
+                    WHERE name = ?
+                """, (new_name, old_name))
+            else:
+                # 新名字已存在，则删除旧名字
+                self.cursor.execute("""
+                    DELETE FROM all_names 
+                    WHERE name = ?
+                """, (old_name,))
+            
+            self.conn.commit()
+            
+            # 3. 重新计算新名字人员的增长率
+            self.recalculate_person_growth_rates(new_name)
+            
+            return True
+        except Exception as e:
+            print(f"重命名人员失败: {e}")
+            self.conn.rollback()
+            return False
+
     def update_all_names_from_performance(self):
         """从performance表更新ALL_NAMES，确保performance中的姓名都在ALL_NAMES中"""
         self.cursor.execute("SELECT DISTINCT name FROM performance WHERE name IS NOT NULL AND name != ''")
