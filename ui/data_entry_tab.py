@@ -599,18 +599,26 @@ class DataEntryTab(QWidget):
             else:
                 position = ''
                 sort_order = row_position
-                
+            
+            # 格式化业绩数据（浮点数保留2位小数）
+            left_perf_display = f"{float(row_data[1]):.2f}" if row_data[1] is not None else "0.00"
+            right_perf_display = f"{float(row_data[2]):.2f}" if row_data[2] is not None else "0.00"
+            
+            # 格式化增长率数据（浮点数保留2位小数）
+            left_growth_display = f"{float(row_data[5]):.2f}" if row_data[5] is not None else "0.00"
+            right_growth_display = f"{float(row_data[6]):.2f}" if row_data[6] is not None else "0.00"
+            total_growth_display = f"{float(row_data[7]):.2f}" if row_data[7] is not None else "0.00"
+            
             # 不显示编号，直接从职级开始
-            reordered_data = (position, row_data[0], row_data[1], row_data[3], row_data[2], row_data[4], row_data[5], row_data[6], row_data[7])
+            reordered_data = (position, row_data[0], left_perf_display, row_data[3], right_perf_display, row_data[4], left_growth_display, right_growth_display, total_growth_display)
             
             for col, item in enumerate(reordered_data):
                 cell_item = QTableWidgetItem(str(item))
                 # 设置增长百分比列为只读（后3列）
                 if col >= 6:
                     cell_item.setFlags(cell_item.flags() & ~Qt.ItemIsEditable)
-                    # 格式化百分比显示
-                    if isinstance(item, (int, float)):
-                        cell_item.setText(f"{item:.2f}%")
+                    # 增长率已经格式化过，直接添加%符号
+                    cell_item.setText(f"{str(item)}%")
                 # 姓名列使用下拉框
                 elif col == 1:  # 姓名列
                     cell_item = QTableWidgetItem(str(item))
@@ -953,17 +961,25 @@ class DataEntryTab(QWidget):
                 position = row_data[8] if row_data[8] else ''
             else:
                 position = ''
+            
+            # 格式化业绩数据（浮点数保留2位小数）
+            left_perf_display = f"{float(row_data[1]):.2f}" if row_data[1] is not None else "0.00"
+            right_perf_display = f"{float(row_data[2]):.2f}" if row_data[2] is not None else "0.00"
+            
+            # 格式化增长率数据（浮点数保留2位小数）
+            left_growth_display = f"{float(row_data[5]):.2f}" if row_data[5] is not None else "0.00"
+            right_growth_display = f"{float(row_data[6]):.2f}" if row_data[6] is not None else "0.00"
+            total_growth_display = f"{float(row_data[7]):.2f}" if row_data[7] is not None else "0.00"
                 
-            reordered_data = (row_data[0], position, row_data[1], row_data[3], row_data[2], row_data[4], row_data[5], row_data[6], row_data[7])
+            reordered_data = (row_data[0], position, left_perf_display, row_data[3], right_perf_display, row_data[4], left_growth_display, right_growth_display, total_growth_display)
             
             for col, item in enumerate(reordered_data):
                 cell_item = QTableWidgetItem(str(item))
                 # 设置增长百分比列为只读（后3列）
                 if col >= 6:
                     cell_item.setFlags(cell_item.flags() & ~Qt.ItemIsEditable)
-                    # 格式化百分比显示
-                    if isinstance(item, (int, float)):
-                        cell_item.setText(f"{item:.2f}%")
+                    # 增长率已经格式化过，直接添加%符号
+                    cell_item.setText(f"{str(item)}%")
                 # 设置数值列为可编辑（除了时期和职级列）
                 elif col > 1:  # 除了时期和职级列，其他列都是数值
                     if col in [2, 4]:  # 左区业绩、右区业绩列
