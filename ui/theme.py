@@ -412,6 +412,70 @@ QAbstractScrollArea::corner {
     background-color: #eef2f6;
 }
 
+QFrame#chartZoomBar {
+    background-color: transparent;
+    color: #64748b;
+}
+
+QLabel#chartZoomHint, QLabel#chartZoomValue {
+    color: #64748b;
+}
+
+QLabel#chartZoomHint:disabled, QLabel#chartZoomValue:disabled {
+    color: #94a3b8;
+}
+
+QSlider {
+    min-height: 26px;
+}
+
+QSlider::groove:horizontal {
+    height: 6px;
+    border: 1px solid #cbd5e1;
+    border-radius: 3px;
+    background-color: #e2e8f0;
+}
+
+QSlider::sub-page:horizontal {
+    border: 1px solid #2563eb;
+    border-radius: 3px;
+    background-color: #3b82f6;
+}
+
+QSlider::add-page:horizontal {
+    border: 1px solid #cbd5e1;
+    border-radius: 3px;
+    background-color: #e2e8f0;
+}
+
+QSlider::handle:horizontal {
+    width: 16px;
+    margin: -6px 0;
+    border: 1px solid #1d4ed8;
+    border-radius: 8px;
+    background-color: #ffffff;
+}
+
+QSlider::handle:horizontal:hover {
+    border-color: #1e40af;
+    background-color: #eff6ff;
+}
+
+QSlider:focus::groove:horizontal {
+    border-color: #60a5fa;
+}
+
+QSlider:disabled::sub-page:horizontal,
+QSlider:disabled::add-page:horizontal {
+    border-color: #cbd5e1;
+    background-color: #e2e8f0;
+}
+
+QSlider:disabled::handle:horizontal {
+    border-color: #94a3b8;
+    background-color: #f1f5f9;
+}
+
 QScrollBar:vertical {
     width: 12px;
     margin: 0;

@@ -81,6 +81,9 @@ class ThemeTests(unittest.TestCase):
             "QToolButton:hover",
             "QTableWidget QComboBox",
             "QTableWidget:focus",
+            "QSlider::groove:horizontal",
+            "QSlider::handle:horizontal:hover",
+            "QSlider:focus::groove:horizontal",
             "QScrollBar::handle:vertical",
             "QScrollBar::handle:horizontal",
         ):
