@@ -1,1194 +1,975 @@
-# ui/data_entry_tab.py
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-                               QTableWidget, QTableWidgetItem, QPushButton, QComboBox,
-                               QSpinBox, QTextEdit, QMessageBox, QHeaderView, QTabWidget)
-from PyQt5.QtCore import QDate, Qt
+from PyQt5.QtCore import QDate, QSignalBlocker, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QDoubleValidator, QIntValidator, QKeySequence
+from PyQt5.QtWidgets import (
+    QAbstractItemView,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QFrame,
+    QHeaderView,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QShortcut,
+    QSpinBox,
+    QStyledItemDelegate,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
 try:
     from .rename_person_dialog import RenamePersonDialog
 except ImportError:  # 支持直接运行本文件
     from rename_person_dialog import RenamePersonDialog
 
+
+class NumericDelegate(QStyledItemDelegate):
+    """为业绩和订单列提供兼容 Qt5 的数值编辑器。"""
+
+    def __init__(self, integer=False, parent=None):
+        super().__init__(parent)
+        self.integer = integer
+
+    def createEditor(self, parent, option, index):
+        editor = QLineEdit(parent)
+        if self.integer:
+            editor.setValidator(QIntValidator(-2147483648, 2147483647, editor))
+        else:
+            validator = QDoubleValidator(editor)
+            validator.setNotation(QDoubleValidator.StandardNotation)
+            validator.setDecimals(6)
+            editor.setValidator(validator)
+        return editor
+
+
+class PeriodPickerDialog(QDialog):
+    """通过年月和上下半月选择时期，避免自由文本格式错误。"""
+
+    def __init__(self, parent=None, initial_period=None):
+        super().__init__(parent)
+        self.setWindowTitle("选择时期")
+        self.setModal(True)
+
+        today = QDate.currentDate()
+        year = today.year()
+        month = today.month()
+        half = "上" if today.day() <= 15 else "下"
+        if initial_period:
+            try:
+                parts = str(initial_period).split("-")
+                year = int(parts[0])
+                month = int(parts[1])
+                half = parts[2]
+            except (ValueError, IndexError):
+                pass
+
+        form = QFormLayout(self)
+        self.year_spin = QSpinBox()
+        self.year_spin.setRange(2020, 2099)
+        self.year_spin.setValue(year)
+        self.month_combo = QComboBox()
+        self.month_combo.addItems([f"{value:02d}月" for value in range(1, 13)])
+        self.month_combo.setCurrentIndex(max(0, min(11, month - 1)))
+        self.half_combo = QComboBox()
+        self.half_combo.addItems(["上", "下"])
+        self.half_combo.setCurrentText(half if half in ("上", "下") else "上")
+
+        form.addRow("年份", self.year_spin)
+        form.addRow("月份", self.month_combo)
+        form.addRow("半月", self.half_combo)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def selected_period(self):
+        return (
+            f"{self.year_spin.value()}-"
+            f"{self.month_combo.currentIndex() + 1:02d}-"
+            f"{self.half_combo.currentText()}"
+        )
+
+
 class DataEntryTab(QWidget):
+    """按时期和按人员维护业绩数据，并统一管理未保存状态。"""
+
+    dirtyChanged = pyqtSignal(bool)
+    statusMessage = pyqtSignal(str, int)
+
+    PERIOD_HEADERS = [
+        "职级", "姓名", "左区业绩", "左区订单", "右区业绩", "右区订单",
+        "左区增长%", "右区增长%", "总增长%",
+    ]
+    PERSON_HEADERS = [
+        "时期", "职级", "左区业绩", "左区订单", "右区业绩", "右区订单",
+        "左区增长%", "右区增长%", "总增长%",
+    ]
+
     def __init__(self, db_manager):
         super().__init__()
         self.db = db_manager
+        self._loading = False
+        self._validation_guard = False
+        self._period_dirty = False
+        self._person_dirty = False
+        self._loaded_period = None
+        self._loaded_person = ""
+        self._active_internal_tab = 0
+        self._person_deleted_periods = set()
+        self._shortcuts = []
         self.init_ui()
+
+    @staticmethod
+    def _set_button_role(button, role):
+        button.setProperty("role", role)
+        return button
 
     def init_ui(self):
         layout = QVBoxLayout(self)
-
-        # 创建标签页控件
+        layout.setContentsMargins(0, 0, 0, 0)
         self.tabs = QTabWidget()
+        self.tabs.setObjectName("dataManagementTabs")
         layout.addWidget(self.tabs)
 
-        # 创建两个标签页
         self.period_tab = QWidget()
         self.person_tab = QWidget()
-        
         self.tabs.addTab(self.period_tab, "按时期管理")
         self.tabs.addTab(self.person_tab, "按人员管理")
-        
-        # 初始化两个标签页
         self.init_period_tab()
         self.init_person_tab()
-        
-        # 监听标签页切换事件
         self.tabs.currentChanged.connect(self.on_internal_tab_changed)
+        self._install_shortcuts()
 
-
+    def _configure_table(self, table, headers):
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setAlternatingRowColors(True)
+        table.setSelectionBehavior(QAbstractItemView.SelectItems)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setEditTriggers(
+            QAbstractItemView.DoubleClicked
+            | QAbstractItemView.EditKeyPressed
+            | QAbstractItemView.SelectedClicked
+        )
+        table.verticalHeader().setDefaultSectionSize(34)
+        table.verticalHeader().setMinimumSectionSize(28)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setMinimumSectionSize(70)
+        header.setStretchLastSection(True)
+        for column, width in enumerate((92, 120, 100, 88, 100, 88, 96, 96, 96)):
+            table.setColumnWidth(column, width)
+        table.setItemDelegateForColumn(2, NumericDelegate(False, table))
+        table.setItemDelegateForColumn(3, NumericDelegate(True, table))
+        table.setItemDelegateForColumn(4, NumericDelegate(False, table))
+        table.setItemDelegateForColumn(5, NumericDelegate(True, table))
 
     def init_period_tab(self):
-        """初始化按时期管理标签页"""
         layout = QVBoxLayout(self.period_tab)
+        selector_card = QFrame()
+        selector_card.setProperty("card", True)
+        selector_layout = QHBoxLayout(selector_card)
+        selector_layout.setContentsMargins(12, 8, 12, 8)
+        selector_layout.addWidget(QLabel("时期"))
 
-        # 1. 时期选择器
-        period_layout = QHBoxLayout()
-        period_layout.addWidget(QLabel("选择时期："))
         self.year_spin = QSpinBox()
         self.year_spin.setRange(2020, 2099)
         self.year_spin.setValue(QDate.currentDate().year())
-        self.year_spin.setMinimumWidth(100)
-        self.year_spin.setMaximumWidth(120)
-        self.year_spin.valueChanged.connect(self.load_period_data)  # 自动刷新
-        self.year_spin.setStyleSheet("""
-            QSpinBox {
-                background-color: #34495e;
-                color: white;
-                border: 1px solid #2c3e50;
-                padding: 4px 8px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QSpinBox::up-button, QSpinBox::down-button {
-                background-color: #2c3e50;
-                border: none;
-                width: 20px;
-            }
-            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
-                background-color: #34495e;
-            }
-            QSpinBox::up-arrow, QSpinBox::down-arrow {
-                border: 2px solid white;
-                width: 6px;
-                height: 6px;
-            }
-            QSpinBox::up-arrow {
-                border-bottom: none;
-                border-left: none;
-                transform: rotate(-45deg);
-            }
-            QSpinBox::down-arrow {
-                border-top: none;
-                border-right: none;
-                transform: rotate(-45deg);
-            }
-        """)
-        period_layout.addWidget(QLabel("年份："))
-        period_layout.addWidget(self.year_spin)
-
+        self.year_spin.setSuffix(" 年")
+        self.year_spin.setMinimumWidth(105)
+        selector_layout.addWidget(self.year_spin)
         self.month_combo = QComboBox()
-        self.month_combo.addItems([f"{i:02d}月" for i in range(1, 13)])
+        self.month_combo.addItems([f"{value:02d} 月" for value in range(1, 13)])
         self.month_combo.setCurrentIndex(QDate.currentDate().month() - 1)
-        self.month_combo.setMinimumWidth(100)
-        self.month_combo.setMaximumWidth(120)
-        self.month_combo.currentIndexChanged.connect(self.load_period_data)  # 自动刷新
-        self.month_combo.setStyleSheet("""
-            QComboBox {
-                background-color: #34495e;
-                color: white;
-                border: 1px solid #2c3e50;
-                padding: 4px 8px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QComboBox::drop-down {
-                border: none;
-                background-color: #2c3e50;
-                width: 20px;
-            }
-            QComboBox::down-arrow {
-                image: none;
-                border: 2px solid white;
-                border-top: none;
-                border-right: none;
-                width: 6px;
-                height: 6px;
-                margin-right: 6px;
-                transform: rotate(-45deg);
-            }
-            QComboBox QAbstractItemView {
-                background-color: #34495e;
-                color: white;
-                selection-background-color: #2c3e50;
-            }
-        """)
-        period_layout.addWidget(QLabel("月份："))
-        period_layout.addWidget(self.month_combo)
-
+        self.month_combo.setMinimumWidth(90)
+        selector_layout.addWidget(self.month_combo)
         self.half_combo = QComboBox()
-        self.half_combo.addItems(["上", "下"])
-        self.half_combo.setMinimumWidth(100)
-        self.half_combo.setMaximumWidth(120)
-        self.half_combo.currentIndexChanged.connect(self.load_period_data)  # 自动刷新
-        self.half_combo.setStyleSheet("""
-            QComboBox {
-                background-color: #34495e;
-                color: white;
-                border: 1px solid #2c3e50;
-                padding: 4px 8px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QComboBox::drop-down {
-                border: none;
-                background-color: #2c3e50;
-                width: 20px;
-            }
-            QComboBox::down-arrow {
-                image: none;
-                border: 2px solid white;
-                border-top: none;
-                border-right: none;
-                width: 6px;
-                height: 6px;
-                margin-right: 6px;
-                transform: rotate(-45deg);
-            }
-            QComboBox QAbstractItemView {
-                background-color: #34495e;
-                color: white;
-                selection-background-color: #2c3e50;
-            }
-        """)
-        period_layout.addWidget(QLabel("半月："))
-        period_layout.addWidget(self.half_combo)
+        self.half_combo.addItems(["上半月", "下半月"])
+        self.half_combo.setMinimumWidth(96)
+        selector_layout.addWidget(self.half_combo)
+        latest_button = self._set_button_role(QPushButton("回到最新"), "secondary")
+        latest_button.clicked.connect(self.navigate_to_latest_period)
+        selector_layout.addWidget(latest_button)
+        selector_layout.addStretch()
+        layout.addWidget(selector_card)
 
-        period_layout.addStretch()
-        
-        layout.addLayout(period_layout)
-
-        # 2. 数据表格 (按时期)
-        self.table = QTableWidget()
-        self.table.setColumnCount(9)  # 恢复为9列，编号列隐藏
-        self.table.setHorizontalHeaderLabels([
-            "职级", "姓名", "左区业绩", "左区订单", "右区业绩", "右区订单", 
-            "左区增长%", "右区增长%", "总增长%"
-        ])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        layout.addWidget(self.table)
-
-        # 3. 人员管理区域
-        person_mgmt_layout = QHBoxLayout()
-        
-        # 添加新人员功能
-        person_mgmt_layout.addWidget(QLabel("人员管理："))
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel("姓名库"))
         self.new_person_input = QLineEdit()
-        self.new_person_input.setPlaceholderText("输入新人员姓名...")
-        self.new_person_input.setMaximumWidth(150)
-        person_mgmt_layout.addWidget(self.new_person_input)
-        
-        self.add_person_button = QPushButton("添加新人员")
+        self.new_person_input.setPlaceholderText("输入新人员姓名")
+        self.new_person_input.setMaximumWidth(170)
+        self.new_person_input.returnPressed.connect(self.add_new_person)
+        toolbar.addWidget(self.new_person_input)
+        self.add_person_button = self._set_button_role(QPushButton("新增人员"), "secondary")
         self.add_person_button.clicked.connect(self.add_new_person)
-        self.add_person_button.setMinimumWidth(100)
-        self.add_person_button.setStyleSheet("""
-            QPushButton {
-                background-color: #2ecc71;
-                color: white;
-                border: none;
-                padding: 6px 12px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #27ae60;
-            }
-            QPushButton:pressed {
-                background-color: #1e8449;
-            }
-        """)
-        person_mgmt_layout.addWidget(self.add_person_button)
-        
-        # 修改人名按钮
-        self.rename_person_button = QPushButton("修改人名")
+        toolbar.addWidget(self.add_person_button)
+        self.rename_person_button = self._set_button_role(QPushButton("重命名"), "secondary")
         self.rename_person_button.clicked.connect(self.open_rename_dialog)
-        self.rename_person_button.setMinimumWidth(100)
-        self.rename_person_button.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db;
-                color: white;
-                border: none;
-                padding: 6px 12px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #2980b9;
-            }
-            QPushButton:pressed {
-                background-color: #21618c;
-            }
-        """)
-        person_mgmt_layout.addWidget(self.rename_person_button)
-        
-        person_mgmt_layout.addStretch()
-        
-        layout.addLayout(person_mgmt_layout)
-
-        # 4. 添加行/删除行按钮
-        table_actions_layout = QHBoxLayout()
-        self.add_row_button = QPushButton("添加记录")
+        toolbar.addWidget(self.rename_person_button)
+        toolbar.addStretch()
+        self.add_row_button = self._set_button_role(QPushButton("新增记录"), "secondary")
         self.add_row_button.clicked.connect(self.add_row)
-        self.add_row_button.setMinimumWidth(100)
-        self.add_row_button.setStyleSheet("""
-            QPushButton {
-                background-color: #27ae60;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #2ecc71;
-            }
-            QPushButton:pressed {
-                background-color: #1e8449;
-            }
-        """)
-        table_actions_layout.addWidget(self.add_row_button)
-        self.del_row_button = QPushButton("删除所选")
+        toolbar.addWidget(self.add_row_button)
+        self.move_up_button = self._set_button_role(QPushButton("上移"), "secondary")
+        self.move_up_button.clicked.connect(self.move_row_up)
+        toolbar.addWidget(self.move_up_button)
+        self.move_down_button = self._set_button_role(QPushButton("下移"), "secondary")
+        self.move_down_button.clicked.connect(self.move_row_down)
+        toolbar.addWidget(self.move_down_button)
+        self.del_row_button = self._set_button_role(QPushButton("删除"), "danger")
         self.del_row_button.clicked.connect(self.delete_row)
-        self.del_row_button.setMinimumWidth(100)
-        self.del_row_button.setStyleSheet("""
-            QPushButton {
-                background-color: #e74c3c;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #c0392b;
-            }
-            QPushButton:pressed {
-                background-color: #a93226;
-            }
-        """)
-        table_actions_layout.addWidget(self.del_row_button)
-        table_actions_layout.addStretch()
-        layout.addLayout(table_actions_layout)
+        toolbar.addWidget(self.del_row_button)
+        layout.addLayout(toolbar)
 
-        # 5. 本期总结
-        layout.addWidget(QLabel("本期总结："))
+        self.table = QTableWidget()
+        self._configure_table(self.table, self.PERIOD_HEADERS)
+        self.table.itemChanged.connect(self._on_period_item_changed)
+        layout.addWidget(self.table, 1)
+        layout.addWidget(QLabel("本期总结"))
         self.summary_text = QTextEdit()
-        self.summary_text.setPlaceholderText("在此输入本期的总结...")
-        self.summary_text.setMaximumHeight(100)
+        self.summary_text.setPlaceholderText("记录本期重点、异常与后续行动")
+        self.summary_text.setMinimumHeight(72)
+        self.summary_text.setMaximumHeight(104)
+        self.summary_text.textChanged.connect(self._mark_period_dirty)
         layout.addWidget(self.summary_text)
 
-        # 6. 保存和刷新按钮
-        save_layout = QHBoxLayout()
-        self.save_button = QPushButton("保存当前时期数据")
+        footer = QHBoxLayout()
+        self.period_dirty_label = QLabel("已保存")
+        self.period_dirty_label.setProperty("state", "clean")
+        footer.addWidget(self.period_dirty_label)
+        self.refresh_button = self._set_button_role(QPushButton("重新加载"), "secondary")
+        self.refresh_button.clicked.connect(self.reload_current_view)
+        footer.addWidget(self.refresh_button)
+        footer.addStretch()
+        self.save_button = self._set_button_role(QPushButton("保存当前时期"), "primary")
         self.save_button.clicked.connect(self.save_data)
-        self.save_button.setMinimumWidth(150)
-        self.save_button.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #2980b9;
-            }
-            QPushButton:pressed {
-                background-color: #21618c;
-            }
-        """)
-        save_layout.addWidget(self.save_button)
-        
-        self.refresh_button = QPushButton("刷新数据")
-        self.refresh_button.clicked.connect(self.load_period_data)
-        self.refresh_button.setMinimumWidth(100)
-        self.refresh_button.setStyleSheet("""
-            QPushButton {
-                background-color: #95a5a6;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #7f8c8d;
-            }
-            QPushButton:pressed {
-                background-color: #5d6d7e;
-            }
-        """)
-        save_layout.addWidget(self.refresh_button)
-        save_layout.addStretch()
-        
-        layout.addLayout(save_layout)
+        footer.addWidget(self.save_button)
+        layout.addLayout(footer)
 
-        # 添加排序按钮到按时期管理界面
-        button_layout = QHBoxLayout()
-        
-        # 上移按钮
-        self.move_up_button = QPushButton("上移")
-        self.move_up_button.clicked.connect(self.move_row_up)
-        self.move_up_button.setMinimumWidth(80)
-        self.move_up_button.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #2980b9;
-            }
-            QPushButton:pressed {
-                background-color: #21618c;
-            }
-        """)
-        button_layout.addWidget(self.move_up_button)
-        
-        # 下移按钮
-        self.move_down_button = QPushButton("下移")
-        self.move_down_button.clicked.connect(self.move_row_down)
-        self.move_down_button.setMinimumWidth(80)
-        self.move_down_button.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #2980b9;
-            }
-            QPushButton:pressed {
-                background-color: #21618c;
-            }
-        """)
-        button_layout.addWidget(self.move_down_button)
-        
-        button_layout.addStretch()
-        
-        # 在表格后、时期总结前添加按钮布局
-        layout.addLayout(button_layout)
-        
-        # 初始化时自动加载当前时期数据
-        # 设置为数据库中最新的时期，然后初始加载数据
+        self.year_spin.valueChanged.connect(self._on_period_selector_changed)
+        self.month_combo.currentIndexChanged.connect(self._on_period_selector_changed)
+        self.half_combo.currentIndexChanged.connect(self._on_period_selector_changed)
         self.set_to_latest_period()
         self.load_period_data()
 
-    def set_to_latest_period(self):
-        """设置时期选择器为数据库中PERFORMANCE_DATA的最新时期"""
-        try:
-            latest_period = self.db.get_latest_performance_period()
-            if latest_period:
-                # 转换时期格式（从旧格式转换为新格式）
-                latest_period = self.db.convert_period_format(latest_period)
-                
-                # 解析时期格式 "YYYY-MM-上/下"
-                if "-" in latest_period:
-                    parts = latest_period.split("-")
-                    if len(parts) >= 3:
-                        try:
-                            year = int(parts[0])
-                            month = int(parts[1])
-                            half = parts[2]
-                            
-                            # 设置控件值（暂时断开信号连接避免触发加载）
-                            self.year_spin.blockSignals(True)
-                            self.month_combo.blockSignals(True)
-                            self.half_combo.blockSignals(True)
-                            
-                            self.year_spin.setValue(year)
-                            self.month_combo.setCurrentIndex(month - 1)  # 月份索引从0开始
-                            
-                            # 设置上/下半月
-                            half_index = self.half_combo.findText(half)
-                            if half_index >= 0:
-                                self.half_combo.setCurrentIndex(half_index)
-                            
-                            # 恢复信号连接
-                            self.year_spin.blockSignals(False)
-                            self.month_combo.blockSignals(False)
-                            self.half_combo.blockSignals(False)
-                            
-                        except ValueError:
-                            pass  # 如果解析失败，保持默认值
-        except Exception as e:
-            print(f"设置最新时期时出错: {e}")
-
     def init_person_tab(self):
-        """初始化按人员管理标签页"""
         layout = QVBoxLayout(self.person_tab)
-
-        # 1. 人员选择器
-        person_layout = QHBoxLayout()
-        person_layout.addWidget(QLabel("选择人员："))
+        selector_card = QFrame()
+        selector_card.setProperty("card", True)
+        selector_layout = QHBoxLayout(selector_card)
+        selector_layout.setContentsMargins(12, 8, 12, 8)
+        selector_layout.addWidget(QLabel("人员"))
         self.person_combo = QComboBox()
-        self.person_combo.setMinimumWidth(200)
-        self.person_combo.setMaximumWidth(250)
-        self.person_combo.setEditable(True)  # 允许输入新姓名
-        self.person_combo.currentTextChanged.connect(self.load_person_data)  # 自动刷新
-        self.person_combo.setStyleSheet("""
-            QComboBox {
-                background-color: #34495e;
-                color: white;
-                border: 1px solid #2c3e50;
-                padding: 4px 8px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QComboBox::drop-down {
-                border: none;
-                background-color: #2c3e50;
-                width: 20px;
-            }
-            QComboBox::down-arrow {
-                image: none;
-                border: 2px solid white;
-                border-top: none;
-                border-right: none;
-                width: 6px;
-                height: 6px;
-                margin-right: 6px;
-                transform: rotate(-45deg);
-            }
-            QComboBox QAbstractItemView {
-                background-color: #34495e;
-                color: white;
-                selection-background-color: #2c3e50;
-            }
-        """)
-        person_layout.addWidget(self.person_combo)
-        person_layout.addStretch()
-        
-        layout.addLayout(person_layout)
+        self.person_combo.setEditable(True)
+        self.person_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.person_combo.setMinimumWidth(220)
+        self.person_combo.setMaximumWidth(320)
+        selector_layout.addWidget(self.person_combo)
+        selector_layout.addStretch()
+        layout.addWidget(selector_card)
 
-        # 2. 人员数据表格
-        self.person_table = QTableWidget()
-        self.person_table.setColumnCount(9)
-        self.person_table.setHorizontalHeaderLabels([
-            "时期", "职级", "左区业绩", "左区订单", "右区业绩", "右区订单", 
-            "左区增长%", "右区增长%", "总增长%"
-        ])
-        self.person_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        layout.addWidget(self.person_table)
-
-        # 3. 人员表格操作按钮
-        person_actions_layout = QHBoxLayout()
-        self.add_person_period_button = QPushButton("添加新时期")
+        toolbar = QHBoxLayout()
+        self.add_person_period_button = self._set_button_role(QPushButton("新增时期"), "secondary")
         self.add_person_period_button.clicked.connect(self.add_person_period)
-        self.add_person_period_button.setMinimumWidth(100)
-        self.add_person_period_button.setStyleSheet("""
-            QPushButton {
-                background-color: #27ae60;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #2ecc71;
-            }
-            QPushButton:pressed {
-                background-color: #1e8449;
-            }
-        """)
-        person_actions_layout.addWidget(self.add_person_period_button)
-        
-        self.del_person_period_button = QPushButton("删除所选时期")
+        toolbar.addWidget(self.add_person_period_button)
+        self.edit_person_period_button = self._set_button_role(QPushButton("修改时期"), "secondary")
+        self.edit_person_period_button.clicked.connect(self.edit_person_period)
+        toolbar.addWidget(self.edit_person_period_button)
+        self.del_person_period_button = self._set_button_role(QPushButton("删除时期"), "danger")
         self.del_person_period_button.clicked.connect(self.delete_person_period)
-        self.del_person_period_button.setMinimumWidth(120)
-        self.del_person_period_button.setStyleSheet("""
-            QPushButton {
-                background-color: #e74c3c;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #c0392b;
-            }
-            QPushButton:pressed {
-                background-color: #a93226;
-            }
-        """)
-        person_actions_layout.addWidget(self.del_person_period_button)
-        
-        self.save_person_button = QPushButton("保存人员数据")
+        toolbar.addWidget(self.del_person_period_button)
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
+
+        self.person_table = QTableWidget()
+        self._configure_table(self.person_table, self.PERSON_HEADERS)
+        self.person_table.itemChanged.connect(self._on_person_item_changed)
+        layout.addWidget(self.person_table, 1)
+        footer = QHBoxLayout()
+        self.person_dirty_label = QLabel("已保存")
+        self.person_dirty_label.setProperty("state", "clean")
+        footer.addWidget(self.person_dirty_label)
+        self.reload_person_button = self._set_button_role(QPushButton("重新加载"), "secondary")
+        self.reload_person_button.clicked.connect(self.reload_current_view)
+        footer.addWidget(self.reload_person_button)
+        footer.addStretch()
+        self.save_person_button = self._set_button_role(QPushButton("保存人员数据"), "primary")
         self.save_person_button.clicked.connect(self.save_person_data)
-        self.save_person_button.setMinimumWidth(120)
-        self.save_person_button.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #2980b9;
-            }
-            QPushButton:pressed {
-                background-color: #21618c;
-            }
-        """)
-        person_actions_layout.addWidget(self.save_person_button)
-        person_actions_layout.addStretch()
-        
-        layout.addLayout(person_actions_layout)
+        footer.addWidget(self.save_person_button)
+        layout.addLayout(footer)
 
-        # 初始化时刷新人员列表
         self.refresh_person_list()
+        self.person_combo.activated[str].connect(self._on_person_requested)
+        if self.person_combo.lineEdit():
+            self.person_combo.lineEdit().editingFinished.connect(self._on_person_requested)
+        self.load_person_data()
 
-    def get_current_period(self):
-        """从UI控件获取当前选择的时期字符串"""
-        year = self.year_spin.value()
-        month = self.month_combo.currentIndex() + 1
-        half_index = self.half_combo.currentIndex()
-        half_text = "上" if half_index == 0 else "下"
-        return f"{year}-{month:02d}-{half_text}"
+    def _install_shortcuts(self):
+        definitions = (
+            (QKeySequence.Save, self.save_current_view),
+            (QKeySequence(Qt.Key_Insert), self.add_current_row),
+            (QKeySequence("Ctrl+Delete"), self.delete_current_row),
+            (QKeySequence("Alt+Up"), self.move_row_up),
+            (QKeySequence("Alt+Down"), self.move_row_down),
+            (QKeySequence.Refresh, self.reload_current_view),
+        )
+        for sequence, callback in definitions:
+            shortcut = QShortcut(sequence, self)
+            shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(callback)
+            self._shortcuts.append(shortcut)
 
-    def load_period_data(self):
-        """加载选定时期的数据到表格和总结框"""
-        period = self.get_current_period()
-        data = self.db.get_data_by_period(period)
-        summary = self.db.get_summary(period)
-        
-        # 清空表格
-        self.table.setRowCount(0)
-        
-        # 加载数据到表格
-        for index, row_data in enumerate(data):
-            row_position = self.table.rowCount()
-            self.table.insertRow(row_position)
-            # row_data: (name, left_perf, right_perf, left_orders, right_orders, left_growth_pct, right_growth_pct, total_growth_pct, position, sort_order)
-            # 重新排列为: (position, name, left_perf, left_orders, right_perf, right_orders, left_growth_pct, right_growth_pct, total_growth_pct)
-            
-            # 处理可能缺失的position和sort_order字段
-            if len(row_data) >= 10:
-                position = row_data[8] if row_data[8] else ''
-                sort_order = row_data[9] if row_data[9] else row_position
-            else:
-                position = ''
-                sort_order = row_position
-            
-            # 格式化业绩数据（浮点数保留2位小数）
-            left_perf_display = f"{float(row_data[1]):.2f}" if row_data[1] is not None else "0.00"
-            right_perf_display = f"{float(row_data[2]):.2f}" if row_data[2] is not None else "0.00"
-            
-            # 格式化增长率数据（浮点数保留2位小数）
-            left_growth_display = f"{float(row_data[5]):.2f}" if row_data[5] is not None else "0.00"
-            right_growth_display = f"{float(row_data[6]):.2f}" if row_data[6] is not None else "0.00"
-            total_growth_display = f"{float(row_data[7]):.2f}" if row_data[7] is not None else "0.00"
-            
-            # 不显示编号，直接从职级开始
-            reordered_data = (position, row_data[0], left_perf_display, row_data[3], right_perf_display, row_data[4], left_growth_display, right_growth_display, total_growth_display)
-            
-            for col, item in enumerate(reordered_data):
-                cell_item = QTableWidgetItem(str(item))
-                # 设置增长百分比列为只读（后3列）
-                if col >= 6:
-                    cell_item.setFlags(cell_item.flags() & ~Qt.ItemIsEditable)
-                    # 增长率已经格式化过，直接添加%符号
-                    cell_item.setText(f"{str(item)}%")
-                # 姓名列使用下拉框
-                elif col == 1:  # 姓名列
-                    cell_item = QTableWidgetItem(str(item))
-                    self.table.setItem(row_position, col, cell_item)
-                    # 为姓名列设置下拉框
-                    name_combo = QComboBox()
-                    name_combo.setEditable(False)
-                    all_names = self.db.get_all_names()
-                    if str(item) and str(item) not in all_names:
-                        all_names.append(str(item))
-                    name_combo.addItems(all_names)
-                    if str(item) in all_names:
-                        name_combo.setCurrentText(str(item))
-                    self.table.setCellWidget(row_position, col, name_combo)
-                    continue  # 跳过下面的setItem
-                # 设置数值列为可编辑
-                elif col > 1:  # 除了职级、姓名列，其他列都是数值
-                    if col in [2, 4]:  # 左区业绩、右区业绩列
-                        cell_item.setData(0, float(item))
-                    else:  # 左区订单、右区订单列
-                        cell_item.setData(0, int(item))
-                self.table.setItem(row_position, col, cell_item)
-        
-        # 如果没有数据，至少添加一个空行供编辑
-        if len(data) == 0:
-            self.add_row()
-        
-        # 加载总结
-        self.summary_text.setText(summary)
-        
-        # 静默加载，不显示消息框
+    def save_current_view(self):
+        return self.save_data() if self.tabs.currentIndex() == 0 else self.save_person_data()
 
+    def add_current_row(self):
+        self.add_row() if self.tabs.currentIndex() == 0 else self.add_person_period()
 
-    def add_row(self):
-        """在表格末尾添加一个空行"""
-        row_position = self.table.rowCount()
-        self.table.insertRow(row_position)
-        
-        # 为所有列设置空的可编辑项
-        for col in range(self.table.columnCount()):
-            if col >= 6:  # 增长率列设为只读（从第6列开始）
-                item = QTableWidgetItem("0.00%")
-                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                self.table.setItem(row_position, col, item)
-            elif col == 1:  # 姓名列使用下拉框
-                name_combo = QComboBox()
-                name_combo.setEditable(False)
-                all_names = self.db.get_all_names()
-                if all_names:
-                    name_combo.addItems(all_names)
-                    # 默认选中空白选项（第一个）
-                    name_combo.setCurrentIndex(0)
-                self.table.setCellWidget(row_position, col, name_combo)
-            else:
-                item = QTableWidgetItem("")
-                self.table.setItem(row_position, col, item)
+    def delete_current_row(self):
+        self.delete_row() if self.tabs.currentIndex() == 0 else self.delete_person_period()
 
-    def add_new_person(self):
-        """添加新人员到数据库"""
-        new_name = self.new_person_input.text().strip()
-        if not new_name:
-            QMessageBox.warning(self, "输入错误", "请输入新人员姓名")
-            return
-        
-        # 检查是否已存在
-        all_names = self.db.get_all_names()
-        if new_name in all_names:
-            QMessageBox.information(self, "提示", f"人员 '{new_name}' 已存在")
-            self.new_person_input.clear()
-            return
-        
-        # 添加到数据库
-        if self.db.add_name_to_all_names(new_name):
-            QMessageBox.information(self, "添加成功", f"人员 '{new_name}' 已添加成功")
-            self.new_person_input.clear()
-            # 更新所有姓名下拉框
-            self.refresh_name_combos()
-            self.refresh_person_list()
-            if self.db.last_backup_error:
-                QMessageBox.warning(
-                    self,
-                    "备份失败",
-                    "人员已添加，但自动备份失败：\n"
-                    f"{self.db.last_backup_error}",
-                )
-        else:
-            QMessageBox.critical(self, "添加失败", f"添加人员 '{new_name}' 失败")
+    def has_unsaved_changes(self):
+        return self._period_dirty or self._person_dirty
 
-    def open_rename_dialog(self):
-        """打开修改人名对话框"""
-        try:
-            # 创建对话框实例
-            dialog = RenamePersonDialog(self, self.db)
-            
-            # 显示对话框并等待用户操作
-            if dialog.exec_() == dialog.Accepted:
-                # 如果重命名成功，刷新UI
-                if dialog.rename_succeeded:
-                    # 刷新当前表格数据
-                    self.load_period_data()
-                    # 刷新所有姓名下拉框
-                    self.refresh_name_combos()
-                    # 刷新按人员管理标签页中的人员下拉列表
-                    self.refresh_person_list()
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"打开修改人名对话框失败：{e}")
+    def _update_dirty_state(self):
+        self.period_dirty_label.setText("有未保存更改" if self._period_dirty else "已保存")
+        self.period_dirty_label.setProperty("state", "dirty" if self._period_dirty else "clean")
+        self.person_dirty_label.setText("有未保存更改" if self._person_dirty else "已保存")
+        self.person_dirty_label.setProperty("state", "dirty" if self._person_dirty else "clean")
+        for label in (self.period_dirty_label, self.person_dirty_label):
+            label.style().unpolish(label)
+            label.style().polish(label)
+        self.dirtyChanged.emit(self.has_unsaved_changes())
 
-    def refresh_name_combos(self):
-        """刷新表格中所有姓名下拉框"""
-        all_names = self.db.get_all_names()
-        
-        for row in range(self.table.rowCount()):
-            combo = self.table.cellWidget(row, 1)  # 姓名列
-            if isinstance(combo, QComboBox):
-                current_text = combo.currentText()
-                combo.clear()
-                combo_names = list(all_names)
-                if current_text and current_text not in combo_names:
-                    combo_names.append(current_text)
-                combo.addItems(combo_names)
-                if current_text in combo_names:
-                    combo.setCurrentText(current_text)
-                else:
-                    combo.setCurrentIndex(0)  # 默认选中空白选项
+    def _set_period_dirty(self, dirty):
+        if self._period_dirty != bool(dirty):
+            self._period_dirty = bool(dirty)
+            self._update_dirty_state()
 
-    def delete_row(self):
-        """删除当前选中的行"""
-        current_row = self.table.currentRow()
-        if current_row >= 0:
-            # 获取要删除的人员姓名（从下拉框获取）
-            name_combo = self.table.cellWidget(current_row, 1)  # 姓名列
-            if isinstance(name_combo, QComboBox):
-                name = name_combo.currentText().strip()
-                if name:
-                    period = self.get_current_period()
-                    
-                    # 确认删除
-                    reply = QMessageBox.question(self, "确认删除", 
-                                               f"确认要删除 {name} 在 {period} 的数据吗？",
-                                               QMessageBox.Yes | QMessageBox.No)
+    def _set_person_dirty(self, dirty):
+        if self._person_dirty != bool(dirty):
+            self._person_dirty = bool(dirty)
+            self._update_dirty_state()
 
-                    if reply != QMessageBox.Yes:
-                        return
+    def _mark_period_dirty(self, *args):
+        if not self._loading:
+            self._set_period_dirty(True)
 
-                    # 从数据库删除记录
-                    try:
-                        deleted_count = self.db.delete_single_record(name, period)
-                        if deleted_count > 0:
-                            QMessageBox.information(self, "删除成功", f"已从数据库删除 {name}。")
-                            if self.db.last_backup_error:
-                                QMessageBox.warning(
-                                    self,
-                                    "备份失败",
-                                    "记录已删除，但自动备份失败：\n"
-                                    f"{self.db.last_backup_error}",
-                                )
-                        else:
-                            QMessageBox.information(self, "提示", f"在 {period} 中未找到 {name} 的记录。")
-                    except Exception as e:
-                        QMessageBox.critical(self, "删除失败", f"删除数据库记录失败：{e}")
-                        return
-            
-            # 从表格中删除行
-            self.table.removeRow(current_row)
+    def _mark_person_dirty(self, *args):
+        if not self._loading:
+            self._set_person_dirty(True)
 
-    def save_data(self):
-        """从表格和总结框收集数据并保存到数据库"""
-        period = self.get_current_period()
-        data_to_save = []
-        
-        # 修改保存数据的逻辑，确保排序正确保存
-        try:
-            data = []
-            for row in range(self.table.rowCount()):
-                # 获取姓名（从下拉框获取）
-                name_combo = self.table.cellWidget(row, 1)  # 姓名列
-                if isinstance(name_combo, QComboBox):
-                    name = name_combo.currentText().strip()
-                else:
-                    name = ""
-                
-                if not name:
-                    if any(self.table.item(row, col) and self.table.item(row, col).text().strip() 
-                          for col in range(2, 6)):  # 检查左区业绩到右区订单列
-                        QMessageBox.warning(self, "数据错误", f"第 {row+1} 行姓名不能为空。")
-                        return
-                    # 如果姓名为空且没有其他数据，跳过这一行不保存到数据库
-                    continue  # 跳过完全空的行
+    def _resolve_dirty(self, kind):
+        dirty = self._period_dirty if kind == "period" else self._person_dirty
+        if not dirty:
+            return True
+        subject = "当前时期" if kind == "period" else "当前人员"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("存在未保存更改")
+        box.setText(f"{subject}的数据尚未保存。")
+        box.setInformativeText("请选择保存、更改后放弃，或取消当前操作。")
+        save_button = box.addButton("保存", QMessageBox.AcceptRole)
+        discard_button = box.addButton("放弃更改", QMessageBox.DestructiveRole)
+        cancel_button = box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(save_button)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is cancel_button:
+            return False
+        if clicked is save_button:
+            return self.save_data() if kind == "period" else self.save_person_data()
+        if clicked is discard_button:
+            self.load_period_data() if kind == "period" else self.load_person_data()
+            return True
+        return False
 
-                # 读取并转换数据，提供默认值0
-                def get_item_value(r, c, cast_func):
-                    item = self.table.item(r, c)
-                    if not item or not item.text().strip():
-                        return 0
-                    try:
-                        return cast_func(item.text().strip())
-                    except ValueError:
-                        raise ValueError(f"第 {r+1} 行第 {c+1} 列的数据格式无效：'{item.text()}'")
-
-                # 获取职级
-                position_item = self.table.item(row, 0)  # 职级在第0列
-                position = position_item.text().strip() if position_item else ''
-                
-                # 使用当前行号作为排序顺序（从0开始，保存时数据库会用这个值）
-                sort_order = row
-
-                record = {
-                    'name': name,
-                    'position': position,
-                    'sort_order': sort_order,
-                    'left_perf': get_item_value(row, 2, float),      # 左区业绩
-                    'left_orders': get_item_value(row, 3, int),      # 左区订单
-                    'right_perf': get_item_value(row, 4, float),     # 右区业绩
-                    'right_orders': get_item_value(row, 5, int)      # 右区订单
-                }
-                data.append(record)
-
-            # 业绩和总结在同一事务中保存
-            period = self.get_current_period()
-            summary = self.summary_text.toPlainText()
-            backup_ok = self.db.save_period_bundle(period, data, summary)
-            
-            QMessageBox.information(self, "保存成功", f"已成功保存 {len(data)} 条记录到时期：{period}")
-            if not backup_ok:
-                QMessageBox.warning(
-                    self,
-                    "备份失败",
-                    "数据已保存，但自动备份失败：\n"
-                    f"{self.db.last_backup_error}",
-                )
-            
-            # 重新加载数据以确保显示正确的排序
-            self.load_period_data()
-            
-            # 更新姓名下拉框
-            self.refresh_name_combos()
-            
-        except ValueError as e:
-            QMessageBox.warning(self, "数据格式错误", str(e))
-        except Exception as e:
-            QMessageBox.critical(self, "保存失败", f"保存数据时发生未知错误：{e}")
-
-    def move_row_up(self):
-        """上移选中行"""
-        current_row = self.table.currentRow()
-        if current_row > 0:
-            self.swap_table_rows(current_row, current_row - 1)
-            self.table.setCurrentCell(current_row - 1, 1)  # 选中姓名列
-
-    def move_row_down(self):
-        """下移选中行"""
-        current_row = self.table.currentRow()
-        if current_row < self.table.rowCount() - 1:
-            self.swap_table_rows(current_row, current_row + 1)
-            self.table.setCurrentCell(current_row + 1, 1)  # 选中姓名列
-
-    def swap_table_rows(self, row1, row2):
-        """交换表格中两行的数据"""
-        for col in range(self.table.columnCount()):
-            if col == 1:  # 姓名列（下拉框）
-                # 获取两个下拉框
-                combo1 = self.table.cellWidget(row1, col)
-                combo2 = self.table.cellWidget(row2, col)
-                
-                if isinstance(combo1, QComboBox) and isinstance(combo2, QComboBox):
-                    # 交换下拉框中的选中值
-                    text1 = combo1.currentText()
-                    text2 = combo2.currentText()
-                    combo1.setCurrentText(text2)
-                    combo2.setCurrentText(text1)
-            else:
-                # 其他列正常交换
-                item1 = self.table.takeItem(row1, col)
-                item2 = self.table.takeItem(row2, col)
-                self.table.setItem(row1, col, item2)
-                self.table.setItem(row2, col, item1)
-
-    def update_sort_order_and_refresh(self):
-        """更新排序后立即保存并刷新页面，确保姓名下拉框正确显示"""
-        period = self.get_current_period()
-        
-        try:
-            data = []
-            for row in range(self.table.rowCount()):
-                # 获取姓名（从下拉框获取）
-                name_combo = self.table.cellWidget(row, 1)
-                if isinstance(name_combo, QComboBox):
-                    name = name_combo.currentText().strip()
-                else:
-                    name_item = self.table.item(row, 1)
-                    name = name_item.text().strip() if name_item else ""
-                
-                if not name:
-                    continue
-                
-                def get_item_value(r, c, cast_func):
-                    item = self.table.item(r, c)
-                    if not item or not item.text().strip():
-                        return 0
-                    try:
-                        return cast_func(item.text().strip())
-                    except ValueError:
-                        return 0
-                
-                position_item = self.table.item(row, 0)
-                position = position_item.text().strip() if position_item else ''
-                
-                record = {
-                    'name': name,
-                    'position': position,
-                    'sort_order': row,  # 使用当前行位置作为排序
-                    'left_perf': get_item_value(row, 2, float),
-                    'left_orders': get_item_value(row, 3, int),
-                    'right_perf': get_item_value(row, 4, float),
-                    'right_orders': get_item_value(row, 5, int)
-                }
-                data.append(record)
-            
-            # 保存数据到数据库
-            self.db.save_period_data(period, data)
-            
-            # 重新加载页面数据，确保姓名下拉框正确显示
-            self.load_period_data()
-            
-        except Exception as e:
-            print(f"更新排序时出错: {e}")
+    def resolve_pending_changes(self):
+        if self._period_dirty and not self._resolve_dirty("period"):
+            return False
+        if self._person_dirty and not self._resolve_dirty("person"):
+            return False
+        return True
 
     def on_internal_tab_changed(self, index):
-        """处理内部标签页切换事件"""
-        if index == 1:  # 切换到按人员管理标签页
-            self.refresh_person_list()
+        if self._loading or index == self._active_internal_tab:
+            return
+        previous = self._active_internal_tab
+        blocker = QSignalBlocker(self.tabs)
+        self.tabs.setCurrentIndex(previous)
+        del blocker
+        kind = "period" if previous == 0 else "person"
+        if not self._resolve_dirty(kind):
+            return
+        blocker = QSignalBlocker(self.tabs)
+        self.tabs.setCurrentIndex(index)
+        del blocker
+        self._active_internal_tab = index
+        if index == 1:
+            self.refresh_person_list(self._loaded_person)
+            self.load_person_data()
 
-    def refresh_person_list(self):
-        """刷新人员下拉列表"""
-        self.person_combo.clear()
+    def _set_period_controls(self, period):
+        if not period:
+            return
+        try:
+            year_text, month_text, half_text = self.db.convert_period_format(period).split("-", 2)
+            blockers = [QSignalBlocker(self.year_spin), QSignalBlocker(self.month_combo), QSignalBlocker(self.half_combo)]
+            self.year_spin.setValue(int(year_text))
+            self.month_combo.setCurrentIndex(int(month_text) - 1)
+            self.half_combo.setCurrentIndex(0 if half_text == "上" else 1)
+            del blockers
+        except (ValueError, IndexError):
+            return
+
+    def set_to_latest_period(self):
+        latest_period = self.db.get_latest_performance_period()
+        if latest_period:
+            self._set_period_controls(latest_period)
+
+    def navigate_to_latest_period(self):
+        requested = self.db.get_latest_performance_period()
+        if not requested:
+            self.statusMessage.emit("暂无已保存时期", 3000)
+            return
+        requested = self.db.convert_period_format(requested)
+        if requested == self._loaded_period:
+            return
+        if self._period_dirty and not self._resolve_dirty("period"):
+            return
+        self._set_period_controls(requested)
+        self.load_period_data()
+
+    def get_current_period(self):
+        half = "上" if self.half_combo.currentIndex() == 0 else "下"
+        return f"{self.year_spin.value()}-{self.month_combo.currentIndex() + 1:02d}-{half}"
+
+    def _on_period_selector_changed(self, *args):
+        if self._loading:
+            return
+        requested = self.get_current_period()
+        if requested == self._loaded_period:
+            return
+        if self._period_dirty:
+            self._set_period_controls(self._loaded_period)
+            if not self._resolve_dirty("period"):
+                return
+            self._set_period_controls(requested)
+        self.load_period_data()
+
+    @staticmethod
+    def _readonly_growth_item(value):
+        numeric = float(value or 0)
+        item = QTableWidgetItem(f"{numeric:.2f}%")
+        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        if numeric > 0:
+            item.setForeground(QColor("#15803D"))
+        elif numeric < 0:
+            item.setForeground(QColor("#B91C1C"))
+        return item
+
+    @staticmethod
+    def _numeric_item(value, integer=False):
+        if value in (None, ""):
+            text = ""
+        elif integer:
+            text = str(int(value))
+        else:
+            text = f"{float(value):.2f}"
+        item = QTableWidgetItem(text)
+        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        return item
+
+    def _name_combo(self, current_name=""):
+        combo = QComboBox()
+        names = list(self.db.get_all_names())
+        if "" not in names:
+            names.insert(0, "")
+        if current_name and current_name not in names:
+            names.append(current_name)
+        combo.addItems(names)
+        combo.setCurrentText(current_name)
+        combo.currentTextChanged.connect(self._mark_period_dirty)
+        return combo
+
+    def load_period_data(self):
+        period = self.get_current_period()
+        self._loading = True
+        try:
+            data = self.db.get_data_by_period(period)
+            summary = self.db.get_summary(period)
+            self.table.setRowCount(0)
+            for row_data in data:
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+                position = row_data[8] if len(row_data) >= 9 and row_data[8] else ""
+                self.table.setItem(row, 0, QTableWidgetItem(str(position)))
+                self.table.setCellWidget(row, 1, self._name_combo(str(row_data[0])))
+                self.table.setItem(row, 2, self._numeric_item(row_data[1]))
+                self.table.setItem(row, 3, self._numeric_item(row_data[3], True))
+                self.table.setItem(row, 4, self._numeric_item(row_data[2]))
+                self.table.setItem(row, 5, self._numeric_item(row_data[4], True))
+                self.table.setItem(row, 6, self._readonly_growth_item(row_data[5]))
+                self.table.setItem(row, 7, self._readonly_growth_item(row_data[6]))
+                self.table.setItem(row, 8, self._readonly_growth_item(row_data[7]))
+            if not data:
+                self.add_row(mark_dirty=False)
+            self.summary_text.setPlainText(summary or "")
+            self._loaded_period = period
+        finally:
+            self._loading = False
+        self._set_period_dirty(False)
+
+    def add_row(self, checked=False, mark_dirty=True):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(""))
+        self.table.setCellWidget(row, 1, self._name_combo())
+        self.table.setItem(row, 2, self._numeric_item(None))
+        self.table.setItem(row, 3, self._numeric_item(None, True))
+        self.table.setItem(row, 4, self._numeric_item(None))
+        self.table.setItem(row, 5, self._numeric_item(None, True))
+        for column in range(6, 9):
+            self.table.setItem(row, column, self._readonly_growth_item(0))
+        self.table.setCurrentCell(row, 0)
+        if mark_dirty and not self._loading:
+            self._set_period_dirty(True)
+
+    def add_new_person(self):
+        new_name = self.new_person_input.text().strip()
+        if not new_name:
+            QMessageBox.warning(self, "输入错误", "请输入新人员姓名。")
+            self.new_person_input.setFocus()
+            return
+        if new_name in self.db.get_all_names():
+            self.statusMessage.emit(f"人员“{new_name}”已存在", 3000)
+            self.new_person_input.clear()
+            return
+        if not self.db.add_name_to_all_names(new_name):
+            QMessageBox.critical(self, "添加失败", f"无法添加人员“{new_name}”。")
+            return
+        self.new_person_input.clear()
+        self.refresh_name_combos()
+        self.refresh_person_list(new_name)
+        self.statusMessage.emit(f"已添加人员“{new_name}”", 4000)
+        if self.db.last_backup_error:
+            QMessageBox.warning(self, "备份失败", self.db.last_backup_error)
+
+    def _current_period_row_name(self):
+        row = self.table.currentRow()
+        combo = self.table.cellWidget(row, 1) if row >= 0 else None
+        return combo.currentText().strip() if isinstance(combo, QComboBox) else ""
+
+    def open_rename_dialog(self):
+        if not self.resolve_pending_changes():
+            return
+        initial_name = self._current_period_row_name()
+        if self.tabs.currentIndex() == 1:
+            initial_name = self.person_combo.currentText().strip()
+        dialog = RenamePersonDialog(self, self.db, initial_name=initial_name)
+        if dialog.exec_() == QDialog.Accepted and dialog.rename_succeeded:
+            self.load_period_data()
+            self.refresh_name_combos()
+            self.refresh_person_list(dialog.new_name)
+            self.statusMessage.emit(f"已将“{dialog.old_name}”重命名为“{dialog.new_name}”", 5000)
+
+    def refresh_name_combos(self):
+        names = list(self.db.get_all_names())
+        if "" not in names:
+            names.insert(0, "")
+        for row in range(self.table.rowCount()):
+            combo = self.table.cellWidget(row, 1)
+            if not isinstance(combo, QComboBox):
+                continue
+            current = combo.currentText()
+            blocker = QSignalBlocker(combo)
+            combo.clear()
+            combo.addItems(names + ([current] if current and current not in names else []))
+            combo.setCurrentText(current)
+            del blocker
+
+    def delete_row(self):
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "未选择记录", "请先选择要删除的记录。")
+            return
+        combo = self.table.cellWidget(row, 1)
+        name = combo.currentText().strip() if isinstance(combo, QComboBox) else ""
+        if name:
+            reply = QMessageBox.question(
+                self, "确认删除", f"确认从 {self.get_current_period()} 移除 {name} 吗？\n保存当前时期后生效。",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+        self.table.removeRow(row)
+        if hasattr(self, "_set_period_dirty"):
+            self._set_period_dirty(True)
+
+    def _validate_numeric_item(self, table, item, performance_columns, order_columns):
+        if self._loading or self._validation_guard or item.column() not in performance_columns | order_columns:
+            return True
+        text = item.text().strip()
+        valid = True
+        if text:
+            try:
+                float(text) if item.column() in performance_columns else int(text)
+            except ValueError:
+                valid = False
+        self._validation_guard = True
+        blocker = QSignalBlocker(table)
+        item.setBackground(QColor("#FEF2F2") if not valid else QColor(Qt.transparent))
+        item.setToolTip("请输入有效数字" if not valid else "")
+        del blocker
+        self._validation_guard = False
+        return valid
+
+    def _on_period_item_changed(self, item):
+        self._validate_numeric_item(self.table, item, {2, 4}, {3, 5})
+        self._mark_period_dirty()
+
+    def _on_person_item_changed(self, item):
+        self._validate_numeric_item(self.person_table, item, {2, 4}, {3, 5})
+        self._mark_person_dirty()
+
+    @staticmethod
+    def _read_number(table, row, column, cast):
+        item = table.item(row, column)
+        text = item.text().strip() if item else ""
+        if not text:
+            return 0
+        try:
+            return cast(text)
+        except ValueError:
+            raise ValueError(f"第 {row + 1} 行“{table.horizontalHeaderItem(column).text()}”格式无效")
+
+    def save_data(self):
+        period = self._loaded_period or self.get_current_period()
+        try:
+            records = []
+            for row in range(self.table.rowCount()):
+                combo = self.table.cellWidget(row, 1)
+                name = combo.currentText().strip() if isinstance(combo, QComboBox) else ""
+                populated = any(
+                    self.table.item(row, column) and self.table.item(row, column).text().strip()
+                    for column in range(0, 6) if column != 1
+                )
+                if not name:
+                    if populated:
+                        self.table.setCurrentCell(row, 1)
+                        QMessageBox.warning(self, "数据错误", f"第 {row + 1} 行姓名不能为空。")
+                        return False
+                    continue
+                position_item = self.table.item(row, 0)
+                records.append({
+                    "name": name,
+                    "position": position_item.text().strip() if position_item else "",
+                    "sort_order": row,
+                    "left_perf": self._read_number(self.table, row, 2, float),
+                    "left_orders": self._read_number(self.table, row, 3, int),
+                    "right_perf": self._read_number(self.table, row, 4, float),
+                    "right_orders": self._read_number(self.table, row, 5, int),
+                })
+            backup_ok = self.db.save_period_bundle(period, records, self.summary_text.toPlainText())
+        except ValueError as exc:
+            QMessageBox.warning(self, "数据格式错误", str(exc))
+            return False
+        except Exception as exc:
+            QMessageBox.critical(self, "保存失败", f"保存数据时发生错误：{exc}")
+            return False
+        self._set_period_dirty(False)
+        self.load_period_data()
+        self.refresh_name_combos()
+        self.statusMessage.emit(f"已保存 {period} 的 {len(records)} 条记录", 5000)
+        if not backup_ok:
+            QMessageBox.warning(self, "备份失败", "数据已保存，但自动备份失败：\n" + self.db.last_backup_error)
+        return True
+
+    def move_row_up(self):
+        if self.tabs.currentIndex() != 0:
+            return
+        row = self.table.currentRow()
+        if row > 0:
+            self.swap_table_rows(row, row - 1)
+            self.table.setCurrentCell(row - 1, max(0, self.table.currentColumn()))
+
+    def move_row_down(self):
+        if self.tabs.currentIndex() != 0:
+            return
+        row = self.table.currentRow()
+        if 0 <= row < self.table.rowCount() - 1:
+            self.swap_table_rows(row, row + 1)
+            self.table.setCurrentCell(row + 1, max(0, self.table.currentColumn()))
+
+    def swap_table_rows(self, first, second):
+        self._loading = True
+        try:
+            for column in range(self.table.columnCount()):
+                if column == 1:
+                    first_combo = self.table.cellWidget(first, column)
+                    second_combo = self.table.cellWidget(second, column)
+                    first_text, second_text = first_combo.currentText(), second_combo.currentText()
+                    first_blocker, second_blocker = QSignalBlocker(first_combo), QSignalBlocker(second_combo)
+                    first_combo.setCurrentText(second_text)
+                    second_combo.setCurrentText(first_text)
+                    del first_blocker, second_blocker
+                else:
+                    first_item = self.table.takeItem(first, column)
+                    second_item = self.table.takeItem(second, column)
+                    self.table.setItem(first, column, second_item)
+                    self.table.setItem(second, column, first_item)
+        finally:
+            self._loading = False
+        self._set_period_dirty(True)
+
+    def update_sort_order_and_refresh(self):
+        return self.save_data()
+
+    def refresh_person_list(self, preferred_name=None, preserve_current=True):
+        if preserve_current:
+            current = (
+                preferred_name
+                or self._loaded_person
+                or self.person_combo.currentText().strip()
+            )
+        else:
+            current = preferred_name or ""
         names = [name for name in self.db.get_all_names() if name]
+        blocker = QSignalBlocker(self.person_combo)
+        self.person_combo.clear()
         self.person_combo.addItems(names)
+        if current:
+            if current not in names:
+                self.person_combo.addItem(current)
+            self.person_combo.setCurrentText(current)
+        del blocker
+
+    def _on_person_requested(self, requested=None):
+        if self._loading:
+            return
+        requested = str(requested or self.person_combo.currentText()).strip()
+        if requested == self._loaded_person:
+            return
+        if self._person_dirty:
+            blocker = QSignalBlocker(self.person_combo)
+            self.person_combo.setCurrentText(self._loaded_person)
+            del blocker
+            if not self._resolve_dirty("person"):
+                return
+            blocker = QSignalBlocker(self.person_combo)
+            self.person_combo.setCurrentText(requested)
+            del blocker
+        self.load_person_data()
+
+    def _insert_person_row(self, row_data=None, period=None):
+        row = self.person_table.rowCount()
+        self.person_table.insertRow(row)
+        if row_data is None:
+            period_item = QTableWidgetItem(period or "")
+            period_item.setFlags(period_item.flags() & ~Qt.ItemIsEditable)
+            self.person_table.setItem(row, 0, period_item)
+            self.person_table.setItem(row, 1, QTableWidgetItem(""))
+            self.person_table.setItem(row, 2, self._numeric_item(None))
+            self.person_table.setItem(row, 3, self._numeric_item(None, True))
+            self.person_table.setItem(row, 4, self._numeric_item(None))
+            self.person_table.setItem(row, 5, self._numeric_item(None, True))
+            for column in range(6, 9):
+                self.person_table.setItem(row, column, self._readonly_growth_item(0))
+            return row
+        display_period = self.db.convert_period_format(row_data[0])
+        period_item = QTableWidgetItem(display_period)
+        period_item.setFlags(period_item.flags() & ~Qt.ItemIsEditable)
+        period_item.setData(Qt.UserRole, row_data[0])
+        if len(row_data) >= 10:
+            period_item.setData(Qt.UserRole + 1, row_data[9])
+        self.person_table.setItem(row, 0, period_item)
+        position = row_data[8] if len(row_data) >= 9 and row_data[8] else ""
+        self.person_table.setItem(row, 1, QTableWidgetItem(str(position)))
+        self.person_table.setItem(row, 2, self._numeric_item(row_data[1]))
+        self.person_table.setItem(row, 3, self._numeric_item(row_data[3], True))
+        self.person_table.setItem(row, 4, self._numeric_item(row_data[2]))
+        self.person_table.setItem(row, 5, self._numeric_item(row_data[4], True))
+        self.person_table.setItem(row, 6, self._readonly_growth_item(row_data[5]))
+        self.person_table.setItem(row, 7, self._readonly_growth_item(row_data[6]))
+        self.person_table.setItem(row, 8, self._readonly_growth_item(row_data[7]))
+        return row
 
     def load_person_data(self):
-        """加载选定人员的所有时期数据"""
         name = self.person_combo.currentText().strip()
-        
-        # 清空表格
-        self.person_table.setRowCount(0)
-        
-        if not name:
-            return  # 如果没有选择人员，直接返回，不显示警告
-            
-        data = self.db.get_all_data_by_name(name)
-        
-        # 加载数据到表格
-        for row_data in data:
-            row_position = self.person_table.rowCount()
-            self.person_table.insertRow(row_position)
-            # row_data: (period, left_perf, right_perf, left_orders, right_orders,
-            #            left_growth_pct, right_growth_pct, total_growth_pct,
-            #            position, sort_order)
-            # 需要重新排列为: (period, position, left_perf, left_orders, right_perf, right_orders, left_growth_pct, right_growth_pct, total_growth_pct)
-            
-            # 处理可能缺失的position字段
-            if len(row_data) >= 9:
-                position = row_data[8] if row_data[8] else ''
-            else:
-                position = ''
-            
-            # 格式化业绩数据（浮点数保留2位小数）
-            left_perf_display = f"{float(row_data[1]):.2f}" if row_data[1] is not None else "0.00"
-            right_perf_display = f"{float(row_data[2]):.2f}" if row_data[2] is not None else "0.00"
-            
-            # 格式化增长率数据（浮点数保留2位小数）
-            left_growth_display = f"{float(row_data[5]):.2f}" if row_data[5] is not None else "0.00"
-            right_growth_display = f"{float(row_data[6]):.2f}" if row_data[6] is not None else "0.00"
-            total_growth_display = f"{float(row_data[7]):.2f}" if row_data[7] is not None else "0.00"
-                
-            reordered_data = (row_data[0], position, left_perf_display, row_data[3], right_perf_display, row_data[4], left_growth_display, right_growth_display, total_growth_display)
-            
-            for col, item in enumerate(reordered_data):
-                cell_item = QTableWidgetItem(str(item))
-                if col == 0:
-                    # 保留原时期和原时期内排序，编辑时期后可安全迁移记录。
-                    cell_item.setData(Qt.UserRole, row_data[0])
-                    if len(row_data) >= 10:
-                        cell_item.setData(Qt.UserRole + 1, row_data[9])
-                # 设置增长百分比列为只读（后3列）
-                if col >= 6:
-                    cell_item.setFlags(cell_item.flags() & ~Qt.ItemIsEditable)
-                    # 增长率已经格式化过，直接添加%符号
-                    cell_item.setText(f"{str(item)}%")
-                # 设置数值列为可编辑（除了时期和职级列）
-                elif col > 1:  # 除了时期和职级列，其他列都是数值
-                    if col in [2, 4]:  # 左区业绩、右区业绩列
-                        cell_item.setData(0, float(item))
-                    else:  # 左区订单、右区订单列
-                        cell_item.setData(0, int(item))
-                self.person_table.setItem(row_position, col, cell_item)
-        
-        # 不再显示加载结果消息
+        self._loading = True
+        try:
+            self.person_table.setRowCount(0)
+            if name:
+                for row_data in self.db.get_all_data_by_name(name):
+                    self._insert_person_row(row_data=row_data)
+            self._loaded_person = name
+            self._person_deleted_periods.clear()
+        finally:
+            self._loading = False
+        self._set_person_dirty(False)
+
+    def _suggest_next_period(self):
+        if self.person_table.rowCount():
+            item = self.person_table.item(self.person_table.rowCount() - 1, 0)
+            current = item.text().strip() if item else ""
+        else:
+            latest = self.db.get_latest_performance_period()
+            current = self.db.convert_period_format(latest) if latest else ""
+        try:
+            year_text, month_text, half = current.split("-", 2)
+            year, month = int(year_text), int(month_text)
+            if half == "上":
+                return f"{year}-{month:02d}-下"
+            month += 1
+            if month == 13:
+                year, month = year + 1, 1
+            return f"{year}-{month:02d}-上"
+        except (ValueError, IndexError):
+            return None
 
     def add_person_period(self):
-        """为当前人员添加新时期"""
-        row_position = self.person_table.rowCount()
-        self.person_table.insertRow(row_position)
+        if not self.person_combo.currentText().strip():
+            QMessageBox.warning(self, "未选择人员", "请先选择或输入人员姓名。")
+            return
+        dialog = PeriodPickerDialog(self, self._suggest_next_period())
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        period = dialog.selected_period()
+        existing = {
+            self.person_table.item(row, 0).text().strip()
+            for row in range(self.person_table.rowCount()) if self.person_table.item(row, 0)
+        }
+        if period in existing:
+            QMessageBox.warning(self, "时期重复", f"{period} 已存在。")
+            return
+        row = self._insert_person_row(period=period)
+        self.person_table.setCurrentCell(row, 1)
+        self._set_person_dirty(True)
+
+    def edit_person_period(self):
+        row = self.person_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "未选择记录", "请先选择要修改时期的记录。")
+            return
+        item = self.person_table.item(row, 0)
+        dialog = PeriodPickerDialog(self, item.text().strip() if item else None)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        period = dialog.selected_period()
+        for other in range(self.person_table.rowCount()):
+            other_item = self.person_table.item(other, 0)
+            if other != row and other_item and other_item.text().strip() == period:
+                QMessageBox.warning(self, "时期重复", f"{period} 已存在。")
+                return
+        item.setText(period)
+        self._set_person_dirty(True)
 
     def delete_person_period(self):
-        """删除当前选中的时期记录"""
-        current_row = self.person_table.currentRow()
-        if current_row < 0:
-            QMessageBox.warning(self, "提示", "请选择要删除的行")
+        row = self.person_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "未选择记录", "请先选择要删除的时期。")
             return
-            
-        # 获取要删除的时期和人员姓名
-        period_item = self.person_table.item(current_row, 0)
+        item = self.person_table.item(row, 0)
+        period = item.text().strip() if item else ""
         name = self.person_combo.currentText().strip()
-        
-        if period_item and period_item.text().strip() and name:
-            period = period_item.text().strip()
-            
-            # 确认删除
-            reply = QMessageBox.question(self, "确认删除", 
-                                       f"确认要删除 {name} 在 {period} 的数据吗？",
-                                       QMessageBox.Yes | QMessageBox.No)
-            
-            if reply == QMessageBox.Yes:
-                # 从数据库删除记录
-                try:
-                    deleted_count = self.db.delete_single_record(name, period)
-                    if deleted_count > 0:
-                        QMessageBox.information(self, "删除成功", f"已删除 {name} 在 {period} 的记录")
-                        if self.db.last_backup_error:
-                            QMessageBox.warning(
-                                self,
-                                "备份失败",
-                                "记录已删除，但自动备份失败：\n"
-                                f"{self.db.last_backup_error}",
-                            )
-                        # 重新加载数据
-                        self.load_person_data()
-                    else:
-                        QMessageBox.information(self, "提示", f"未找到对应的记录")
-                except Exception as e:
-                    QMessageBox.critical(self, "删除失败", f"删除记录失败：{e}")
-        else:
-            # 如果是空行，直接删除
-            self.person_table.removeRow(current_row)
+        if period:
+            reply = QMessageBox.question(
+                self, "确认删除", f"确认删除 {name} 在 {period} 的记录吗？\n保存人员数据后生效。",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+        original_period = item.data(Qt.UserRole) if item else None
+        if original_period:
+            self._person_deleted_periods.add(original_period)
+        self.person_table.removeRow(row)
+        self._set_person_dirty(True)
 
     def save_person_data(self):
-        """保存人员数据"""
         name = self.person_combo.currentText().strip()
         if not name:
-            QMessageBox.warning(self, "提示", "请选择或输入人员姓名")
-            return
-            
+            QMessageBox.warning(self, "未选择人员", "请选择或输入人员姓名。")
+            return False
         try:
             records = []
             for row in range(self.person_table.rowCount()):
-                # 检查时期是否为空
-                # 获取时期
                 period_item = self.person_table.item(row, 0)
-                if not period_item or not period_item.text().strip():
-                    if any(self.person_table.item(row, col) and self.person_table.item(row, col).text().strip() 
-                          for col in range(1, 6)):  # 检查职级到右区订单列
-                        QMessageBox.warning(self, "数据错误", f"第 {row+1} 行时期不能为空")
-                        return
-                    continue  # 跳过完全空的行
-
-                period = period_item.text().strip()
-
-                # 读取并转换数据
-                def get_item_value(r, c, cast_func):
-                    item = self.person_table.item(r, c)
-                    if not item or not item.text().strip():
-                        return 0
-                    try:
-                        return cast_func(item.text().strip())
-                    except ValueError:
-                        raise ValueError(f"第 {r+1} 行第 {c+1} 列的数据格式无效：'{item.text()}'")
-
-                # 获取职级
+                period = period_item.text().strip() if period_item else ""
+                populated = any(
+                    self.person_table.item(row, column) and self.person_table.item(row, column).text().strip()
+                    for column in range(1, 6)
+                )
+                if not period:
+                    if populated:
+                        QMessageBox.warning(self, "数据错误", f"第 {row + 1} 行时期不能为空。")
+                        return False
+                    continue
                 position_item = self.person_table.item(row, 1)
-                position = position_item.text().strip() if position_item else ''
-
-                left_perf = get_item_value(row, 2, float)      # 左区业绩
-                left_orders = get_item_value(row, 3, int)      # 左区订单
-                right_perf = get_item_value(row, 4, float)     # 右区业绩
-                right_orders = get_item_value(row, 5, int)     # 右区订单
-
                 original_period = period_item.data(Qt.UserRole)
                 original_sort_order = period_item.data(Qt.UserRole + 1)
-                if original_period and original_period != period:
+                original_display = (
+                    self.db.convert_period_format(original_period)
+                    if original_period and hasattr(self.db, "convert_period_format")
+                    else str(original_period or "")
+                )
+                if original_period and original_display != period:
                     original_sort_order = None
-
                 records.append({
-                    'period': period,
-                    'original_period': original_period,
-                    'sort_order': original_sort_order,
-                    'position': position,
-                    'left_perf': left_perf,
-                    'right_perf': right_perf,
-                    'left_orders': left_orders,
-                    'right_orders': right_orders,
+                    "period": period,
+                    "original_period": original_period,
+                    "sort_order": original_sort_order,
+                    "position": position_item.text().strip() if position_item else "",
+                    "left_perf": DataEntryTab._read_number(self.person_table, row, 2, float),
+                    "left_orders": DataEntryTab._read_number(self.person_table, row, 3, int),
+                    "right_perf": DataEntryTab._read_number(self.person_table, row, 4, float),
+                    "right_orders": DataEntryTab._read_number(self.person_table, row, 5, int),
                 })
-
-            if records:
-                backup_ok = self.db.save_person_records(name, records)
-                QMessageBox.information(self, "保存成功", f"已保存 {len(records)} 条记录")
-                if not backup_ok:
-                    QMessageBox.warning(
-                        self,
-                        "备份失败",
-                        "数据已保存，但自动备份失败：\n"
-                        f"{self.db.last_backup_error}",
-                    )
-                # 重新加载数据以显示计算后的增长百分比
-                self.load_person_data()
+            deleted_periods = getattr(self, "_person_deleted_periods", set())
+            if deleted_periods:
+                backup_ok = self.db.save_person_records(
+                    name, records, deleted_periods=sorted(deleted_periods)
+                )
             else:
-                QMessageBox.information(self, "信息", "没有有效数据需要保存")
+                backup_ok = self.db.save_person_records(name, records)
+        except ValueError as exc:
+            QMessageBox.critical(self, "输入错误", f"数据格式错误：{exc}")
+            return False
+        except Exception as exc:
+            QMessageBox.critical(self, "保存失败", f"保存数据时发生错误：{exc}")
+            return False
+        if hasattr(self, "_set_person_dirty"):
+            self._set_person_dirty(False)
+        if hasattr(self, "refresh_person_list"):
+            self.refresh_person_list(name)
+        self.load_person_data()
+        if hasattr(self, "statusMessage"):
+            self.statusMessage.emit(f"已保存 {name} 的 {len(records)} 条记录", 5000)
+        if not backup_ok:
+            QMessageBox.warning(self, "备份失败", "数据已保存，但自动备份失败：\n" + self.db.last_backup_error)
+        return True
 
-        except ValueError as e:
-            QMessageBox.critical(self, "输入错误", f"数据格式错误：{e}")
-        except Exception as e:
-            QMessageBox.critical(self, "保存失败", f"保存数据时发生未知错误：{e}")
-
+    def reload_current_view(self):
+        kind = "period" if self.tabs.currentIndex() == 0 else "person"
+        dirty = self._period_dirty if kind == "period" else self._person_dirty
+        if dirty:
+            reply = QMessageBox.question(
+                self, "放弃更改", "重新加载将放弃当前未保存更改，是否继续？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return False
+        self.load_period_data() if kind == "period" else self.load_person_data()
+        self.statusMessage.emit("已重新加载当前数据", 3000)
+        return True
 
     def update_person_names_cache(self):
-        """更新人员姓名缓存（兼容性方法）"""
-        # 这个方法主要是为了兼容main_window.py中的调用
         self.refresh_name_combos()
-        # 同时更新人员标签页的下拉框
-        if hasattr(self, 'person_combo'):
-            names = [name for name in self.db.get_all_names() if name]
-            current_text = self.person_combo.currentText()
-            self.person_combo.clear()
-            self.person_combo.addItems(names)
-            if current_text in names:
-                self.person_combo.setCurrentText(current_text)
-
-# ===================================================================
-#  独立测试脚本 (可视化)
-#  运行方式: python ui/data_entry_tab.py
-# ===================================================================
-if __name__ == '__main__':
-    import sys
-    import os
-    from PyQt5.QtWidgets import QApplication, QMainWindow
-    # 为了测试，需要能够访问到 database 模块
-    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-    from database import DatabaseManager
-
-    print("--- Running DataEntryTab Visual Test ---")
-    
-    # 使用测试数据库
-    test_db_file = "ui_test.db"
-    if os.path.exists(test_db_file):
-        os.remove(test_db_file)
-        
-    db_manager = DatabaseManager(test_db_file, auto_backup=False)
-    
-    # 添加一些测试数据以便验证加载功能
-    db_manager.save_period_data("2023-01-First Half", [
-        {'name': 'Zhang San', 'left_perf': 100.5, 'right_perf': 150.0, 'left_orders': 10, 'right_orders': 12},
-        {'name': 'Li Si', 'left_perf': 200.0, 'right_perf': 50.5, 'left_orders': 15, 'right_orders': 5}
-    ])
-
-    app = QApplication(sys.argv)
-    window = QMainWindow()
-    window.setWindowTitle("DataEntryTab Test")
-    
-    # 创建并设置中心控件
-    test_widget = DataEntryTab(db_manager)
-    window.setCentralWidget(test_widget)
-    
-    window.setGeometry(300, 300, 800, 600)
-    window.show()
-    
-    print("Test window is now open. Close it to end the test.")
-    app.exec()
-    
-    # 清理
-    del db_manager
-    if os.path.exists(test_db_file):
-        os.remove(test_db_file)
-    print("--- Test Finished ---")
+        self.refresh_person_list()

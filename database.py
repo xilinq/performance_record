@@ -379,11 +379,16 @@ class DatabaseManager:
             self._recalculate_all_growth_rates_no_commit()
         return self._run_auto_backup()
 
-    def save_person_records(self, name, records):
-        """验证完成后，在一个事务中保存某人员的多时期记录。"""
+    def save_person_records(self, name, records, deleted_periods=None):
+        """在一个事务中删除待删时期并保存某人员的多时期记录。"""
         name = self._clean_name(name)
         normalized = []
         target_periods = set()
+        if isinstance(deleted_periods, (str, bytes)):
+            deleted_periods = [deleted_periods]
+        normalized_deleted_periods = {
+            self.normalize_period(period) for period in (deleted_periods or [])
+        }
 
         for record in records:
             period = self.normalize_period(record.get("period"))
@@ -411,6 +416,14 @@ class DatabaseManager:
 
         with self.conn:
             self._ensure_name_no_commit(name, reactivate=True)
+
+            self.cursor.executemany(
+                "DELETE FROM performance WHERE name = ? AND period = ?",
+                [
+                    (name, period)
+                    for period in sorted(normalized_deleted_periods)
+                ],
+            )
 
             for record in normalized:
                 if record["sort_order"] is not None:
@@ -867,7 +880,16 @@ class DatabaseManager:
             return default
         return row[index]
 
-    def import_from_csv(self, csv_file=None):
+    def preview_import_csv(self, csv_file=None):
+        """Validate a CSV import without changing the database.
+
+        The returned dictionary is suitable for presenting an import confirmation
+        dialog.  Invalid files are reported through ``valid``/``error`` instead of
+        raising, and this method deliberately leaves ``last_error`` untouched.
+        """
+        return self.import_from_csv(csv_file, _preview=True)
+
+    def import_from_csv(self, csv_file=None, *, _preview=False):
         """完整校验后再原子替换数据库；兼容旧版 CSV。"""
         source = Path(csv_file) if csv_file is not None else self.backup_path
         source = source.expanduser().resolve()
@@ -1000,6 +1022,39 @@ class DatabaseManager:
                         )
                     )
 
+            if _preview:
+                warnings = []
+                if format_version < self.CSV_FORMAT_VERSION:
+                    warnings.append(
+                        f"旧版 CSV（版本 {format_version}），导入时将按兼容规则转换"
+                    )
+                elif format_version > self.CSV_FORMAT_VERSION:
+                    warnings.append(
+                        f"CSV 版本 {format_version} 高于当前支持版本 "
+                        f"{self.CSV_FORMAT_VERSION}，未知扩展字段将被忽略"
+                    )
+                if summary_header is None:
+                    warnings.append("文件未包含总结数据段")
+                if names_header is None:
+                    warnings.append("文件未包含人员名册，导入时将从业绩记录生成")
+                if columns["position"] is None:
+                    warnings.append("文件未包含职级列，将使用空值")
+                if columns["sort_order"] is None and columns["number"] is None:
+                    warnings.append("文件未包含排序列，将按记录出现顺序排序")
+
+                effective_names = {item["name"] for item in parsed_performance}
+                effective_names.update(item[0] for item in parsed_names)
+                return {
+                    "valid": True,
+                    "path": str(source),
+                    "format_version": format_version,
+                    "performance_count": len(parsed_performance),
+                    "summary_count": len(parsed_summaries),
+                    "name_count": len(effective_names),
+                    "warnings": warnings,
+                    "error": "",
+                }
+
             with self.conn:
                 self.cursor.execute("DELETE FROM performance")
                 self.cursor.execute("DELETE FROM summaries")
@@ -1064,6 +1119,17 @@ class DatabaseManager:
             )
             return True
         except Exception as exc:
+            if _preview:
+                return {
+                    "valid": False,
+                    "path": str(source),
+                    "format_version": None,
+                    "performance_count": 0,
+                    "summary_count": 0,
+                    "name_count": 0,
+                    "warnings": [],
+                    "error": str(exc),
+                }
             self.last_error = str(exc)
             print(f"导入CSV失败: {exc}")
             return False

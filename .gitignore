@@ -3,5 +3,6 @@ build/
 dist/
 ui/__pycache__/
 *.spec
+!PerformanceApp.spec
 *.csv
 *.db
