@@ -5,16 +5,12 @@ from PyQt5.QtWidgets import (QMainWindow, QTabWidget, QMenuBar, QMessageBox,
                                QFileDialog, QInputDialog, QAction)
 from PyQt5.QtCore import Qt
 
-# 添加当前目录到路径以支持直接运行
-sys.path.append(os.path.dirname(__file__))
-
-# 如果from data_entry_tab import DataEntryTab from charts_tab import ChartsTab没找到对应模块，则使用ui包导入
 try:
+    from .data_entry_tab import DataEntryTab
+    from .charts_tab import ChartsTab
+except ImportError:  # 支持直接运行本文件
     from data_entry_tab import DataEntryTab
     from charts_tab import ChartsTab
-except ImportError:
-    from ui.data_entry_tab import DataEntryTab
-    from ui.charts_tab import ChartsTab
 
 class MainWindow(QMainWindow):
     def __init__(self, db_manager):
@@ -118,22 +114,42 @@ class MainWindow(QMainWindow):
                 if self.db.import_from_csv(file_path):
                     QMessageBox.information(self, "导入成功", "数据已成功导入！")
                     # 刷新所有界面
+                    self.data_entry_tab.set_to_latest_period()
                     self.data_entry_tab.refresh_person_list()
+                    self.data_entry_tab.refresh_name_combos()
                     if hasattr(self.data_entry_tab, 'load_period_data'):
                         self.data_entry_tab.load_period_data()
                     self.charts_tab.populate_filters()
+                    if self.db.last_backup_error:
+                        QMessageBox.warning(
+                            self,
+                            "备份失败",
+                            "数据已导入，但自动备份失败：\n"
+                            f"{self.db.last_backup_error}",
+                        )
                 else:
-                    QMessageBox.critical(self, "导入失败", "导入过程中出现错误，请检查文件格式。")
+                    detail = getattr(self.db, "last_error", "")
+                    QMessageBox.critical(
+                        self,
+                        "导入失败",
+                        "导入过程中出现错误，原数据未被修改。"
+                        + (f"\n\n{detail}" if detail else ""),
+                    )
 
     def manual_backup(self):
         """手动备份"""
         from datetime import datetime
         backup_name = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        backup_path = self.db.data_dir / backup_name
         
-        if self.db.export_to_csv(backup_name):
-            QMessageBox.information(self, "备份成功", f"数据已备份到：\n{backup_name}")
+        if self.db.export_to_csv(backup_path):
+            QMessageBox.information(self, "备份成功", f"数据已备份到：\n{backup_path}")
         else:
-            QMessageBox.critical(self, "备份失败", "备份过程中出现错误。")
+            QMessageBox.critical(
+                self,
+                "备份失败",
+                "备份过程中出现错误：\n" + self.db.last_backup_error,
+            )
 
     def recalculate_growth_rates(self):
         """重新计算所有增长率"""
@@ -145,8 +161,15 @@ class MainWindow(QMainWindow):
         )
         
         if reply == QMessageBox.Yes:
-            self.db.recalculate_all_growth_rates()
+            backup_ok = self.db.recalculate_all_growth_rates(create_backup=True)
             QMessageBox.information(self, "计算完成", "所有增长率已重新计算完成！")
+            if not backup_ok:
+                QMessageBox.warning(
+                    self,
+                    "备份失败",
+                    "增长率已重算，但自动备份失败：\n"
+                    f"{self.db.last_backup_error}",
+                )
             # 刷新当前显示的数据
             if hasattr(self.data_entry_tab, 'load_period_data'):
                 self.data_entry_tab.load_period_data()
@@ -154,7 +177,7 @@ class MainWindow(QMainWindow):
     def show_about(self):
         """显示关于对话框"""
         QMessageBox.about(self, "关于业绩追踪系统", 
-                         "业绩追踪系统 v1.1\n\n"
+                         "业绩追踪系统 v1.2\n\n"
                          "功能特点：\n"
                          "• 按时期和人员管理业绩数据\n"
                          "• 自动计算增长百分比\n"
@@ -162,10 +185,10 @@ class MainWindow(QMainWindow):
                          "• 自动CSV备份功能\n"
                          "• 数据导入导出功能\n"
                          "• 智能启动和排序优化\n\n"
-                         "v1.1 更新内容：\n"
+                         "v1.2 更新内容：\n"
                          "• 🆕 最新时期自动加载\n"
                          "• 🆕 姓名下拉框实时同步\n"
-                         "• 🆕 空白姓名选项支持\n\n"
+                         "• 🆕 安全重命名与完整备份\n\n"
                          "每次数据更新都会自动备份到 performance_backup.csv")
         
     def on_tab_changed(self, index):
@@ -196,7 +219,7 @@ if __name__ == '__main__':
     if os.path.exists(test_db_file):
         os.remove(test_db_file)
         
-    db_manager = DatabaseManager(test_db_file)
+    db_manager = DatabaseManager(test_db_file, auto_backup=False)
     
     # 添加模拟真实数据
     print("Adding sample data...")

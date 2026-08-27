@@ -10,7 +10,7 @@ class RenamePersonDialog(QDialog):
         self.db = db_manager
         self.old_name = None
         self.new_name = None
-        self.result = False
+        self.rename_succeeded = False
         
         self.setWindowTitle("修改人名")
         self.setGeometry(100, 100, 400, 200)
@@ -164,13 +164,22 @@ class RenamePersonDialog(QDialog):
                     "重命名成功",
                     f"已成功将 '{old_name}' 修改为 '{new_name}'",
                 )
+                if self.db.last_backup_error:
+                    QMessageBox.warning(
+                        self,
+                        "备份失败",
+                        "姓名已修改，但自动备份失败：\n"
+                        f"{self.db.last_backup_error}",
+                    )
                 self.old_name = old_name
                 self.new_name = new_name
-                self.result = True
+                self.rename_succeeded = True
                 self.accept()
             else:
+                reason = getattr(self.db, "last_error", "")
                 QMessageBox.critical(
                     self, 
                     "重命名失败",
-                    f"修改 '{old_name}' 为 '{new_name}' 失败，请重试"
+                    f"修改 '{old_name}' 为 '{new_name}' 失败。"
+                    + (f"\n\n{reason}" if reason else "请重试。")
                 )

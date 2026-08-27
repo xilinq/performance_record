@@ -20,16 +20,34 @@
     - sqlite3 (数据库，Python内置)
 
 作者: xilin_qian
-版本: 1.1
+版本: 1.2
 """
 
 import sys
-import os
 from pathlib import Path
 
 # 确保可以导入项目模块
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
+
+
+def get_application_data_dir():
+    """返回稳定的数据目录，避免数据库随当前工作目录变化。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return project_root.resolve()
+
+
+def show_fatal_error(message):
+    """在无控制台的 Windows 打包程序中也显示启动错误。"""
+    print(message)
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(0, message, "业绩追踪系统", 0x10)
+        except Exception:
+            pass
 
 def check_dependencies():
     """检查必要的依赖是否已安装"""
@@ -52,15 +70,14 @@ def check_dependencies():
 def main():
     """主函数 - 应用程序入口点"""
     print("=" * 50)
-    print("🚀 业绩追踪系统 v1.1")
+    print("🚀 业绩追踪系统 v1.2")
     print("=" * 50)
     
     # 检查依赖
     print("\n🔍 检查系统依赖...")
     if not check_dependencies():
-        print("\n❌ 依赖检查失败，请安装必要的包后重试")
-        input("按Enter键退出...")
-        sys.exit(1)
+        show_fatal_error("依赖检查失败，请安装 PyQt5 和 matplotlib 后重试。")
+        return 1
     
     # 检查UI模块
     try:
@@ -68,27 +85,24 @@ def main():
         from database import DatabaseManager
         print("✅ 核心模块加载成功")
     except ImportError as e:
-        print(f"❌ 模块导入失败: {e}")
-        print("请确保所有必要文件都在正确位置")
-        input("按Enter键退出...")
-        sys.exit(1)
+        show_fatal_error(f"模块导入失败：{e}\n请确保所有必要文件都在正确位置。")
+        return 1
     
     # 启动PyQt应用
     try:
         from PyQt5.QtWidgets import QApplication
-        from PyQt5.QtCore import Qt
         
         # 创建应用实例
         app = QApplication(sys.argv)
         app.setApplicationName("业绩追踪系统")
-        app.setApplicationVersion("1.1")
+        app.setApplicationVersion("1.2")
         
         # 设置应用图标（如果有的话）
         # app.setWindowIcon(QIcon("icon.png"))
         
         print("\n📊 初始化数据库...")
         # 创建数据库管理器
-        db_manager = DatabaseManager("performance.db")
+        db_manager = DatabaseManager(get_application_data_dir() / "performance.db")
         
         print("🖥️  创建主窗口...")
         # 创建主窗口
@@ -103,15 +117,20 @@ def main():
         print("   - 程序会自动保存数据并生成备份")
         
         # 运行应用主循环
-        sys.exit(app.exec_())
+        return app.exec_()
         
     except Exception as e:
         print(f"\n❌ 启动失败: {e}")
         print("请检查错误信息并重试")
         import traceback
         traceback.print_exc()
-        input("按Enter键退出...")
-        sys.exit(1)
+        try:
+            from PyQt5.QtWidgets import QMessageBox
+
+            QMessageBox.critical(None, "启动失败", f"程序启动失败：\n{e}")
+        except Exception:
+            pass
+        return 1
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

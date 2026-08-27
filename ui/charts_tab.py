@@ -426,7 +426,7 @@ if __name__ == '__main__':
     if os.path.exists(test_db_file):
         os.remove(test_db_file)
     
-    db_manager = DatabaseManager(test_db_file)
+    db_manager = DatabaseManager(test_db_file, auto_backup=False)
     # 插入一些样本数据
     db_manager.save_period_data("2023-01-First Half", [
         {'name': 'Zhang San', 'left_perf': 100, 'right_perf': 150, 'left_orders': 10, 'right_orders': 12},

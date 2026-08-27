@@ -3,7 +3,11 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdi
                                QTableWidget, QTableWidgetItem, QPushButton, QComboBox,
                                QSpinBox, QTextEdit, QMessageBox, QHeaderView, QTabWidget)
 from PyQt5.QtCore import QDate, Qt
-from rename_person_dialog import RenamePersonDialog
+
+try:
+    from .rename_person_dialog import RenamePersonDialog
+except ImportError:  # 支持直接运行本文件
+    from rename_person_dialog import RenamePersonDialog
 
 class DataEntryTab(QWidget):
     def __init__(self, db_manager):
@@ -18,9 +22,6 @@ class DataEntryTab(QWidget):
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
 
-        # 创建两个标签页    def swap_table_rows(self, row1, row2):f.period_tab = QWidget()
-        self.person_tab = QWidget()
-        
         # 创建两个标签页
         self.period_tab = QWidget()
         self.person_tab = QWidget()
@@ -393,18 +394,8 @@ class DataEntryTab(QWidget):
     def set_to_latest_period(self):
         """设置时期选择器为数据库中PERFORMANCE_DATA的最新时期"""
         try:
-            # 直接从performance表获取所有时期，按时期降序排列，只取PERFORMANCE_DATA
-            self.db.cursor.execute("""
-                SELECT DISTINCT period FROM performance 
-                WHERE period IS NOT NULL 
-                ORDER BY period DESC
-            """)
-            performance_periods = [row[0] for row in self.db.cursor.fetchall()]
-            
-            if performance_periods:
-                # 取最新的时期（第一个）
-                latest_period = performance_periods[0]
-                
+            latest_period = self.db.get_latest_performance_period()
+            if latest_period:
                 # 转换时期格式（从旧格式转换为新格式）
                 latest_period = self.db.convert_period_format(latest_period)
                 
@@ -627,6 +618,8 @@ class DataEntryTab(QWidget):
                     name_combo = QComboBox()
                     name_combo.setEditable(False)
                     all_names = self.db.get_all_names()
+                    if str(item) and str(item) not in all_names:
+                        all_names.append(str(item))
                     name_combo.addItems(all_names)
                     if str(item) in all_names:
                         name_combo.setCurrentText(str(item))
@@ -694,25 +687,27 @@ class DataEntryTab(QWidget):
             self.new_person_input.clear()
             # 更新所有姓名下拉框
             self.refresh_name_combos()
+            self.refresh_person_list()
+            if self.db.last_backup_error:
+                QMessageBox.warning(
+                    self,
+                    "备份失败",
+                    "人员已添加，但自动备份失败：\n"
+                    f"{self.db.last_backup_error}",
+                )
         else:
             QMessageBox.critical(self, "添加失败", f"添加人员 '{new_name}' 失败")
 
     def open_rename_dialog(self):
         """打开修改人名对话框"""
         try:
-            # 导入重命名对话框类
-            try:
-                from rename_person_dialog import RenamePersonDialog
-            except ImportError:
-                from ui.rename_person_dialog import RenamePersonDialog
-            
             # 创建对话框实例
             dialog = RenamePersonDialog(self, self.db)
             
             # 显示对话框并等待用户操作
             if dialog.exec_() == dialog.Accepted:
                 # 如果重命名成功，刷新UI
-                if dialog.result:
+                if dialog.rename_succeeded:
                     # 刷新当前表格数据
                     self.load_period_data()
                     # 刷新所有姓名下拉框
@@ -731,8 +726,11 @@ class DataEntryTab(QWidget):
             if isinstance(combo, QComboBox):
                 current_text = combo.currentText()
                 combo.clear()
-                combo.addItems(all_names)
-                if current_text in all_names:
+                combo_names = list(all_names)
+                if current_text and current_text not in combo_names:
+                    combo_names.append(current_text)
+                combo.addItems(combo_names)
+                if current_text in combo_names:
                     combo.setCurrentText(current_text)
                 else:
                     combo.setCurrentIndex(0)  # 默认选中空白选项
@@ -752,18 +750,27 @@ class DataEntryTab(QWidget):
                     reply = QMessageBox.question(self, "确认删除", 
                                                f"确认要删除 {name} 在 {period} 的数据吗？",
                                                QMessageBox.Yes | QMessageBox.No)
-                    
-                    if reply == QMessageBox.Yes:
-                        # 从数据库删除记录
-                        try:
-                            deleted_count = self.db.delete_single_record(name, period)
-                            if deleted_count > 0:
-                                QMessageBox.information(self, "删除成功", f"已从数据库删除 {name}。")
-                            else:
-                                QMessageBox.information(self, "提示", f"在 {period} 中未找到 {name} 的记录。")
-                        except Exception as e:
-                            QMessageBox.critical(self, "删除失败", f"删除数据库记录失败：{e}")
-                            return
+
+                    if reply != QMessageBox.Yes:
+                        return
+
+                    # 从数据库删除记录
+                    try:
+                        deleted_count = self.db.delete_single_record(name, period)
+                        if deleted_count > 0:
+                            QMessageBox.information(self, "删除成功", f"已从数据库删除 {name}。")
+                            if self.db.last_backup_error:
+                                QMessageBox.warning(
+                                    self,
+                                    "备份失败",
+                                    "记录已删除，但自动备份失败：\n"
+                                    f"{self.db.last_backup_error}",
+                                )
+                        else:
+                            QMessageBox.information(self, "提示", f"在 {period} 中未找到 {name} 的记录。")
+                    except Exception as e:
+                        QMessageBox.critical(self, "删除失败", f"删除数据库记录失败：{e}")
+                        return
             
             # 从表格中删除行
             self.table.removeRow(current_row)
@@ -820,15 +827,19 @@ class DataEntryTab(QWidget):
                 }
                 data.append(record)
 
-            # 保存时期数据
+            # 业绩和总结在同一事务中保存
             period = self.get_current_period()
-            self.db.save_period_data(period, data)
-            
-            # 保存总结
             summary = self.summary_text.toPlainText()
-            self.db.save_summary(period, summary)
+            backup_ok = self.db.save_period_bundle(period, data, summary)
             
             QMessageBox.information(self, "保存成功", f"已成功保存 {len(data)} 条记录到时期：{period}")
+            if not backup_ok:
+                QMessageBox.warning(
+                    self,
+                    "备份失败",
+                    "数据已保存，但自动备份失败：\n"
+                    f"{self.db.last_backup_error}",
+                )
             
             # 重新加载数据以确保显示正确的排序
             self.load_period_data()
@@ -934,7 +945,7 @@ class DataEntryTab(QWidget):
     def refresh_person_list(self):
         """刷新人员下拉列表"""
         self.person_combo.clear()
-        names = self.db.get_distinct_names()
+        names = [name for name in self.db.get_all_names() if name]
         self.person_combo.addItems(names)
 
     def load_person_data(self):
@@ -953,7 +964,9 @@ class DataEntryTab(QWidget):
         for row_data in data:
             row_position = self.person_table.rowCount()
             self.person_table.insertRow(row_position)
-            # row_data: (period, left_perf, right_perf, left_orders, right_orders, left_growth_pct, right_growth_pct, total_growth_pct, position)
+            # row_data: (period, left_perf, right_perf, left_orders, right_orders,
+            #            left_growth_pct, right_growth_pct, total_growth_pct,
+            #            position, sort_order)
             # 需要重新排列为: (period, position, left_perf, left_orders, right_perf, right_orders, left_growth_pct, right_growth_pct, total_growth_pct)
             
             # 处理可能缺失的position字段
@@ -975,6 +988,11 @@ class DataEntryTab(QWidget):
             
             for col, item in enumerate(reordered_data):
                 cell_item = QTableWidgetItem(str(item))
+                if col == 0:
+                    # 保留原时期和原时期内排序，编辑时期后可安全迁移记录。
+                    cell_item.setData(Qt.UserRole, row_data[0])
+                    if len(row_data) >= 10:
+                        cell_item.setData(Qt.UserRole + 1, row_data[9])
                 # 设置增长百分比列为只读（后3列）
                 if col >= 6:
                     cell_item.setFlags(cell_item.flags() & ~Qt.ItemIsEditable)
@@ -1020,6 +1038,13 @@ class DataEntryTab(QWidget):
                     deleted_count = self.db.delete_single_record(name, period)
                     if deleted_count > 0:
                         QMessageBox.information(self, "删除成功", f"已删除 {name} 在 {period} 的记录")
+                        if self.db.last_backup_error:
+                            QMessageBox.warning(
+                                self,
+                                "备份失败",
+                                "记录已删除，但自动备份失败：\n"
+                                f"{self.db.last_backup_error}",
+                            )
                         # 重新加载数据
                         self.load_person_data()
                     else:
@@ -1038,7 +1063,7 @@ class DataEntryTab(QWidget):
             return
             
         try:
-            saved_count = 0
+            records = []
             for row in range(self.person_table.rowCount()):
                 # 检查时期是否为空
                 # 获取时期
@@ -1069,13 +1094,34 @@ class DataEntryTab(QWidget):
                 left_perf = get_item_value(row, 2, float)      # 左区业绩
                 left_orders = get_item_value(row, 3, int)      # 左区订单
                 right_perf = get_item_value(row, 4, float)     # 右区业绩
-                right_orders = get_item_value(row, 5, int)     # 右区订单                # 保存单条记录
-                # 保存到数据库
-                self.db.save_single_record(name, period, left_perf, right_perf, left_orders, right_orders, position, row)
-                saved_count += 1
-            
-            if saved_count > 0:
-                QMessageBox.information(self, "保存成功", f"已保存 {saved_count} 条记录")
+                right_orders = get_item_value(row, 5, int)     # 右区订单
+
+                original_period = period_item.data(Qt.UserRole)
+                original_sort_order = period_item.data(Qt.UserRole + 1)
+                if original_period and original_period != period:
+                    original_sort_order = None
+
+                records.append({
+                    'period': period,
+                    'original_period': original_period,
+                    'sort_order': original_sort_order,
+                    'position': position,
+                    'left_perf': left_perf,
+                    'right_perf': right_perf,
+                    'left_orders': left_orders,
+                    'right_orders': right_orders,
+                })
+
+            if records:
+                backup_ok = self.db.save_person_records(name, records)
+                QMessageBox.information(self, "保存成功", f"已保存 {len(records)} 条记录")
+                if not backup_ok:
+                    QMessageBox.warning(
+                        self,
+                        "备份失败",
+                        "数据已保存，但自动备份失败：\n"
+                        f"{self.db.last_backup_error}",
+                    )
                 # 重新加载数据以显示计算后的增长百分比
                 self.load_person_data()
             else:
@@ -1093,7 +1139,7 @@ class DataEntryTab(QWidget):
         self.refresh_name_combos()
         # 同时更新人员标签页的下拉框
         if hasattr(self, 'person_combo'):
-            names = self.db.get_distinct_names()
+            names = [name for name in self.db.get_all_names() if name]
             current_text = self.person_combo.currentText()
             self.person_combo.clear()
             self.person_combo.addItems(names)
@@ -1119,7 +1165,7 @@ if __name__ == '__main__':
     if os.path.exists(test_db_file):
         os.remove(test_db_file)
         
-    db_manager = DatabaseManager(test_db_file)
+    db_manager = DatabaseManager(test_db_file, auto_backup=False)
     
     # 添加一些测试数据以便验证加载功能
     db_manager.save_period_data("2023-01-First Half", [
