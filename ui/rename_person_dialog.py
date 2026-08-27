@@ -8,6 +8,14 @@ from PyQt5.QtWidgets import (
 )
 
 
+def _mutation_status(result):
+    legacy = bool(result)
+    return (
+        bool(getattr(result, "committed", legacy)),
+        bool(getattr(result, "mirror_ok", legacy)),
+    )
+
+
 class RenamePersonDialog(QDialog):
     """安全地重命名人员，并使用平台标准按钮顺序。"""
 
@@ -77,8 +85,14 @@ class RenamePersonDialog(QDialog):
         if reply != QMessageBox.Yes:
             return
 
-        if not self.db.rename_person(old_name, new_name):
-            reason = getattr(self.db, "last_error", "")
+        mutation = self.db.rename_person(old_name, new_name)
+        committed, mirror_ok = _mutation_status(mutation)
+        if not committed:
+            reason = str(
+                getattr(mutation, "error", "")
+                or getattr(self.db, "last_error", "")
+                or ""
+            )
             QMessageBox.critical(
                 self,
                 "重命名失败",
@@ -90,10 +104,16 @@ class RenamePersonDialog(QDialog):
         self.old_name = old_name
         self.new_name = new_name
         self.rename_succeeded = True
-        if self.db.last_backup_error:
+        mirror_error = str(
+            getattr(mutation, "mirror_error", "")
+            or getattr(self.db, "last_backup_error", "")
+            or ""
+        )
+        if not mirror_ok or mirror_error:
             QMessageBox.warning(
                 self,
-                "备份失败",
-                "姓名已修改，但自动备份失败：\n" + self.db.last_backup_error,
+                "CSV 镜像更新失败",
+                "姓名已修改，但 CSV 镜像更新失败：\n"
+                + (mirror_error or "未知错误"),
             )
         self.accept()

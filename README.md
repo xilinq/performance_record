@@ -27,7 +27,9 @@ python main.py
 ```
 performance_record/          # 项目根目录
 ├── main.py                  # 🚀 应用程序主入口
-├── database.py              # 📊 数据库管理核心模块
+├── runtime_bootstrap.py     # Windows/Conda 原生 DLL 启动引导
+├── database.py              # 📊 SQLite 主库与事务管理
+├── csv_codec.py             # 📄 纯数据 CSV v3 编解码
 ├── ui/                      # 🖥️ 用户界面模块
 │   ├── __init__.py         #    UI包初始化文件
 │   ├── main_window.py      #    主窗口界面组件
@@ -35,6 +37,9 @@ performance_record/          # 项目根目录
 │   ├── charts_tab.py       #    图表显示界面组件
 │   └── rename_person_dialog.py # 姓名修改对话框
 ├── tests/                  # 自动化回归测试
+├── run_tests.py            # Windows DLL 安全、按模块隔离的测试运行器
+├── run_tests.bat           # performance_record 环境测试入口
+├── runtime_bootstrap.py    # Conda/Windows 原生 DLL 搜索路径引导
 ├── previous_data_process.py # 旧版CSV转换工具
 ├── README.md               # 📖 项目说明文档
 ├── requirements.txt        # 📦 Python依赖包列表
@@ -50,8 +55,12 @@ performance_record/          # 项目根目录
 
 #### 📊 database.py  
 - **功能**: 数据库操作的核心模块
-- **职责**: SQLite数据管理、CSV导入导出、数据一致性维护
+- **职责**: SQLite 主数据管理、事务一致性及 CSV 镜像编排
 - **测试**: `python database.py`
+
+#### 📄 csv_codec.py
+- **功能**: 无 SQLite、无 Qt 依赖的 CSV 编解码
+- **职责**: v1/v2 兼容读取、v3 原始数据写出、文件摘要和原子替换
 
 #### 🖥️ ui/main_window.py
 - **功能**: 主窗口界面控制器
@@ -84,11 +93,11 @@ performance_record/          # 项目根目录
 - **显示设置**: 图表字体选项可折叠并自动记忆
 
 ### 💾 数据导入导出
-- **标准CSV格式**: 支持带编号的新格式，兼容旧版本数据
-- **完整备份**: 保存职级、排序、总结及人员启停状态
-- **实时自动备份**: 每次数据保存时自动生成备份文件
+- **纯数据 CSV v3**: 只保存业绩、订单、职级、排序、总结及人员状态
+- **兼容旧格式**: 可读取 v1/v2，旧文件中的增长率会被忽略并由程序重新计算
+- **自动镜像**: SQLite 提交成功后原子更新 `performance_backup.csv`
 - **数据完整性**: 确保导入导出过程中数据的完整和一致
-- **导入预检**: 覆盖数据前先验证文件并显示记录数量和兼容性提示
+- **导入预检**: 解析一次并校验文件摘要，覆盖前显示记录数量和兼容性提示
 
 ### 🚀 智能启动
 - **🆕 最新时期加载**: 程序启动时自动显示数据库中最新的业绩时期
@@ -105,17 +114,21 @@ python database.py
 # 直接运行界面模块（调试用）
 python ui/main_window.py
 
-# 运行回归测试
-python -m unittest discover -s tests -v
+# 运行回归测试（推荐；自动激活 Conda 并逐模块隔离）
+run_tests.bat
 
 # 构建 Win7/Win11 64 位单文件版本
 pyinstall.bat
 ```
 
+不要通过绝对路径直接启动 Conda 环境中的 `python.exe` 运行 NumPy/Matplotlib
+测试；该方式不会注入 `Library\bin`，可能以 `0xC06D007F` 退出。无批处理环境
+时使用 `conda run --no-capture-output -n performance_record python run_tests.py`。
+
 ### 数据文件
-- `performance.db` - 主数据库文件（自动创建）
-- `performance_backup.csv` - 自动备份文件
-- `backup_YYYYMMDD_HHMMSS.csv` - 手动备份文件
+- `performance.db` - 唯一业务主库（自动创建）
+- `performance_backup.csv` - App 管理的已提交 SQLite 数据自动镜像（启动及提交后刷新）
+- `backup_YYYYMMDD_HHMMSS_ffffff.csv` - 不覆盖的手动备份文件
 
 源码运行时数据固定保存在项目根目录；打包程序运行时数据固定保存在可执行文件所在目录，不受启动时工作目录影响。
 
@@ -139,9 +152,11 @@ pyinstall.bat
 3. 查看业绩趋势和增长率图表
 
 ### 数据管理
-- **自动备份**: 每次保存时自动生成 `performance_backup.csv`
+- **自动备份**: 每次成功提交 SQLite 后更新 `performance_backup.csv`
 - **手动备份**: 文件菜单 → 备份数据
 - **数据导入**: 文件菜单 → 导入CSV数据
+
+CSV 不会在启动时自动覆盖 SQLite。需要用 Excel 等工具编辑时，请先导出一份独立 CSV 并关闭 App；编辑完成后通过“导入 CSV”预检并显式写入主库。`performance_backup.csv` 由 App 管理，不应作为编辑稿。增长率、编号等派生值不写入 v3 CSV。
 
 ## 🎯 版本信息
 
@@ -163,5 +178,5 @@ pyinstall.bat
 遇到问题时请检查：
 1. 控制台输出的错误信息
 2. 确保所有依赖包正确安装
-3. 检查数据库文件访问权限
+3. 检查 EXE 所在目录是否可写；软件不允许两个实例同时编辑同一数据目录
 4. 参考详细功能说明文档

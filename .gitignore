@@ -6,3 +6,4 @@ ui/__pycache__/
 !PerformanceApp.spec
 *.csv
 *.db
+*.lock

@@ -1,25 +1,71 @@
 # database.py
-import csv
 import math
-import os
-import re
 import sqlite3
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
+
+from csv_codec import (
+    CSV_FORMAT_VERSION as CURRENT_CSV_FORMAT_VERSION,
+    MAX_INTEGER,
+    MAX_PERIOD_YEAR as PERIOD_MAX_YEAR,
+    MIN_PERIOD_YEAR as PERIOD_MIN_YEAR,
+    MIN_INTEGER,
+    PERIOD_PATTERN as CANONICAL_PERIOD_PATTERN,
+    CsvCodec,
+    CsvNameRecord,
+    CsvPerformanceRecord,
+    CsvSnapshot,
+    CsvSummaryRecord,
+    ImportPlan,
+    normalize_period,
+)
+
+__all__ = ["DatabaseManager", "MutationResult", "ImportPlan"]
+
+
+@dataclass(frozen=True)
+class MutationResult:
+    """Outcome of a database mutation, independent from CSV mirror status."""
+
+    committed: bool
+    mirror_ok: bool = True
+    error: str = ""
+    mirror_error: str = ""
+    affected_rows: int = 0
+    pre_import_backup: str = ""
+
+    def __bool__(self):
+        return self.committed
+
+    @property
+    def backup_succeeded(self):
+        """Compatibility alias for callers using the previous terminology."""
+        return self.mirror_ok
+
+    @property
+    def backup_error(self):
+        """Compatibility alias for callers using the previous terminology."""
+        return self.mirror_error
 
 
 class DatabaseManager:
     """集中管理 SQLite 数据、派生增长率和 CSV 备份。"""
 
-    CSV_FORMAT_VERSION = 2
-    PERIOD_PATTERN = re.compile(
-        r"^(?P<year>\d{4})-(?P<month>\d{1,2})-(?P<half>上|下|First Half|Second Half)$"
-    )
+    CSV_FORMAT_VERSION = CURRENT_CSV_FORMAT_VERSION
+    PERIOD_PATTERN = CANONICAL_PERIOD_PATTERN
+    MIN_PERIOD_YEAR = PERIOD_MIN_YEAR
+    MAX_PERIOD_YEAR = PERIOD_MAX_YEAR
 
     def __init__(self, db_name="performance.db", auto_backup=True):
         connection_target = str(db_name)
-        self.auto_backup_enabled = auto_backup
+        # An in-memory database has no stable data directory and must never
+        # leak an automatic mirror into the process working directory.
+        self.auto_backup_enabled = bool(
+            auto_backup and connection_target != ":memory:"
+        )
         self.last_error = ""
         self.last_backup_error = ""
 
@@ -93,6 +139,14 @@ class DatabaseManager:
                     )
 
         self.initialize_all_names()
+        with self.conn:
+            self._normalize_sort_orders_no_commit()
+        # The automatic CSV is an app-owned mirror, so refresh it on every
+        # disk-backed startup as well as after commits.  This upgrades an old
+        # v1/v2 mirror and repairs a missing or stale mirror without treating
+        # CSV as an input source.
+        if self.auto_backup_enabled:
+            self._run_auto_backup()
 
     def initialize_all_names(self):
         """将已有业绩中的姓名补入名册，不改变现有启停状态。"""
@@ -101,12 +155,15 @@ class DatabaseManager:
             "WHERE name IS NOT NULL AND TRIM(name) != ''"
         )
         existing_names = [row[0].strip() for row in self.cursor.fetchall()]
+        changes_before = self.conn.total_changes
         with self.conn:
             self.cursor.executemany(
                 "INSERT OR IGNORE INTO all_names (name, is_active) VALUES (?, 1)",
                 [(name,) for name in existing_names],
             )
+        added = self.conn.total_changes - changes_before
         print(f"初始化ALL_NAMES表完成，包含 {len(existing_names)} 个姓名")
+        return added
 
     @staticmethod
     def _clean_name(name):
@@ -133,12 +190,11 @@ class DatabaseManager:
             with self.conn:
                 self._ensure_name_no_commit(name, reactivate=True)
             self.last_error = ""
-            self._run_auto_backup()
-            return True
+            return self._finish_mutation(affected_rows=1)
         except Exception as exc:
             self.last_error = str(exc)
             print(f"添加姓名到ALL_NAMES失败: {exc}")
-            return False
+            return MutationResult(committed=False, error=str(exc))
 
     def get_all_names(self, active_only=True):
         """获取姓名列表，并在首位提供空白选项。"""
@@ -156,36 +212,20 @@ class DatabaseManager:
                 "UPDATE all_names SET is_active = 0 WHERE name = ?",
                 (self._clean_name(name),),
             )
-        return self._run_auto_backup()
+            affected_rows = self.cursor.rowcount
+        return self._finish_mutation(
+            affected_rows=affected_rows, run_mirror=bool(affected_rows)
+        )
 
     def activate_name(self, name):
         with self.conn:
             self._ensure_name_no_commit(name, reactivate=True)
-        return self._run_auto_backup()
+        return self._finish_mutation(affected_rows=1)
 
     @classmethod
     def normalize_period(cls, period):
         """验证时期并转换成数据库统一格式。"""
-        value = str(period).strip().replace(".", "-") if period is not None else ""
-        match = cls.PERIOD_PATTERN.fullmatch(value)
-        if not match:
-            raise ValueError(
-                "时期格式无效，应为 YYYY-MM-上/下 或 YYYY-MM-First/Second Half"
-            )
-
-        year = int(match.group("year"))
-        month = int(match.group("month"))
-        if not 1 <= month <= 12:
-            raise ValueError("时期中的月份必须在 1 到 12 之间")
-
-        half = match.group("half")
-        canonical_half = {
-            "上": "First Half",
-            "下": "Second Half",
-            "First Half": "First Half",
-            "Second Half": "Second Half",
-        }[half]
-        return f"{year:04d}-{month:02d}-{canonical_half}"
+        return normalize_period(period)
 
     @classmethod
     def convert_period_format(cls, period):
@@ -211,9 +251,12 @@ class DatabaseManager:
         try:
             if isinstance(value, float) and not value.is_integer():
                 raise ValueError
-            return int(value if value not in (None, "") else 0)
+            result = int(value if value not in (None, "") else 0)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"{field_name}必须是整数") from exc
+        if not MIN_INTEGER <= result <= MAX_INTEGER:
+            raise ValueError(f"{field_name}超出支持的整数范围")
+        return result
 
     def _normalize_metrics(self, record):
         return {
@@ -272,27 +315,61 @@ class DatabaseManager:
         for name in [row[0] for row in self.cursor.fetchall()]:
             self._recalculate_person_growth_rates_no_commit(name)
 
+    def _normalize_sort_orders_no_commit(self, periods=None):
+        """Make persisted row order contiguous and deterministic per period."""
+        if periods is None:
+            self.cursor.execute("SELECT DISTINCT period FROM performance")
+            canonical_periods = [row[0] for row in self.cursor.fetchall()]
+        else:
+            canonical_periods = sorted({period for period in periods if period})
+
+        changed = 0
+        for period in canonical_periods:
+            self.cursor.execute(
+                """
+                SELECT name, sort_order
+                FROM performance
+                WHERE period = ?
+                ORDER BY CASE WHEN sort_order IS NULL THEN 1 ELSE 0 END,
+                         sort_order ASC, name ASC
+                """,
+                (period,),
+            )
+            for expected_order, (name, current_order) in enumerate(
+                self.cursor.fetchall()
+            ):
+                if current_order == expected_order:
+                    continue
+                self.cursor.execute(
+                    "UPDATE performance SET sort_order = ? "
+                    "WHERE name = ? AND period = ?",
+                    (expected_order, name, period),
+                )
+                changed += self.cursor.rowcount
+        return changed
+
     def calculate_growth_percentage(self, name, period, left_perf, right_perf):
         """计算给定记录相对上一时期的增长率。"""
         name = self._clean_name(name)
         canonical_period = self.normalize_period(period)
+        left_perf = self._coerce_float(left_perf, "左区业绩")
+        right_perf = self._coerce_float(right_perf, "右区业绩")
         self.cursor.execute(
             """
-            SELECT period, left_perf, right_perf
+            SELECT left_perf, right_perf
             FROM performance
-            WHERE name = ?
-            ORDER BY period ASC
+            WHERE name = ? AND period < ?
+            ORDER BY period DESC
+            LIMIT 1
             """,
-            (name,),
+            (name, canonical_period),
         )
-        history = self.cursor.fetchall()
-        periods = [row[0] for row in history]
-        if canonical_period not in periods:
+        previous = self.cursor.fetchone()
+        if previous is None:
             return 0.0, 0.0, 0.0
-        current_index = periods.index(canonical_period)
-        if current_index == 0:
-            return 0.0, 0.0, 0.0
-        _, previous_left, previous_right = history[current_index - 1]
+        previous_left, previous_right = previous
+        previous_left = self._coerce_float(previous_left, "上一时期左区业绩")
+        previous_right = self._coerce_float(previous_right, "上一时期右区业绩")
         return (
             self._growth(left_perf, previous_left),
             self._growth(right_perf, previous_right),
@@ -302,32 +379,42 @@ class DatabaseManager:
     def recalculate_all_growth_rates(self, create_backup=False):
         with self.conn:
             self._recalculate_all_growth_rates_no_commit()
-        return self._run_auto_backup() if create_backup else True
+        return self._finish_mutation(run_mirror=create_backup)
 
     def recalculate_person_growth_rates(self, name, create_backup=False):
         with self.conn:
             self._recalculate_person_growth_rates_no_commit(self._clean_name(name))
-        return self._run_auto_backup() if create_backup else True
+        return self._finish_mutation(run_mirror=create_backup)
 
     def _normalize_period_records(self, period, data_list):
         canonical_period = self.normalize_period(period)
         normalized = []
         seen_names = set()
+        sort_orders = []
         for index, record in enumerate(data_list):
             name = self._clean_name(record.get("name"))
             if name in seen_names:
                 raise ValueError(f"同一时期不能重复选择人员：{name}")
             seen_names.add(name)
             metrics = self._normalize_metrics(record)
+            raw_sort_order = record.get("sort_order")
+            sort_order = (
+                index
+                if raw_sort_order is None
+                else self._coerce_int(raw_sort_order, "排序编号")
+            )
+            if sort_order < 0:
+                raise ValueError("排序编号不能为负数")
+            sort_orders.append(sort_order)
             metrics.update(
                 {
                     "name": name,
-                    "sort_order": self._coerce_int(
-                        record.get("sort_order", index), "排序编号"
-                    ),
+                    "sort_order": sort_order,
                 }
             )
             normalized.append(metrics)
+        if sorted(sort_orders) != list(range(len(normalized))):
+            raise ValueError("同一时期的排序编号必须唯一且连续，从 0 开始")
         return canonical_period, normalized
 
     def _replace_period_data_no_commit(self, period, records):
@@ -359,8 +446,9 @@ class DatabaseManager:
         canonical_period, records = self._normalize_period_records(period, data_list)
         with self.conn:
             self._replace_period_data_no_commit(canonical_period, records)
+            self._normalize_sort_orders_no_commit([canonical_period])
             self._recalculate_all_growth_rates_no_commit()
-        return self._run_auto_backup()
+        return self._finish_mutation(affected_rows=len(records))
 
     def save_period_bundle(self, period, data_list, summary):
         """原子保存某时期的业绩和总结，并仅备份一次。"""
@@ -376,8 +464,9 @@ class DatabaseManager:
                 """,
                 (canonical_period, summary_text),
             )
+            self._normalize_sort_orders_no_commit([canonical_period])
             self._recalculate_all_growth_rates_no_commit()
-        return self._run_auto_backup()
+        return self._finish_mutation(affected_rows=len(records))
 
     def save_person_records(self, name, records, deleted_periods=None):
         """在一个事务中删除待删时期并保存某人员的多时期记录。"""
@@ -389,6 +478,7 @@ class DatabaseManager:
         normalized_deleted_periods = {
             self.normalize_period(period) for period in (deleted_periods or [])
         }
+        affected_periods = set(normalized_deleted_periods)
 
         for record in records:
             period = self.normalize_period(record.get("period"))
@@ -405,6 +495,11 @@ class DatabaseManager:
             explicit_order = record.get("sort_order")
             if explicit_order is not None:
                 explicit_order = self._coerce_int(explicit_order, "排序编号")
+                if explicit_order < 0:
+                    raise ValueError("排序编号不能为负数")
+            affected_periods.add(period)
+            if original_period:
+                affected_periods.add(original_period)
             metrics.update(
                 {
                     "period": period,
@@ -480,8 +575,9 @@ class DatabaseManager:
                         record["sort_order"],
                     ),
                 )
+            self._normalize_sort_orders_no_commit(affected_periods)
             self._recalculate_person_growth_rates_no_commit(name)
-        return self._run_auto_backup()
+        return self._finish_mutation(affected_rows=len(normalized))
 
     def save_single_record(
         self,
@@ -520,19 +616,27 @@ class DatabaseManager:
             )
             deleted_count = self.cursor.rowcount
             if deleted_count:
+                self._normalize_sort_orders_no_commit([canonical_period])
                 self._recalculate_person_growth_rates_no_commit(name)
         if deleted_count:
-            self._run_auto_backup()
-        return deleted_count
+            return self._finish_mutation(affected_rows=deleted_count)
+        return self._finish_mutation(affected_rows=0, run_mirror=False)
 
     def rename_person(self, old_name, new_name):
         """原子重命名；存在同期间冲突时安全拒绝，不覆盖任何记录。"""
         try:
             old_name = self._clean_name(old_name)
             new_name = self._clean_name(new_name)
+            self.cursor.execute(
+                "SELECT 1 FROM all_names WHERE name = ? "
+                "UNION ALL SELECT 1 FROM performance WHERE name = ? LIMIT 1",
+                (old_name, old_name),
+            )
+            if self.cursor.fetchone() is None:
+                self.last_error = f"原姓名不存在：{old_name}"
+                return MutationResult(committed=False, error=self.last_error)
             if old_name == new_name:
-                self.last_error = ""
-                return True
+                return self._finish_mutation(affected_rows=0, run_mirror=False)
 
             self.cursor.execute(
                 """
@@ -550,7 +654,14 @@ class DatabaseManager:
                     "新旧姓名在以下时期均有记录，无法安全合并："
                     + "、".join(conflicts)
                 )
-                return False
+                return MutationResult(committed=False, error=self.last_error)
+
+            self.cursor.execute(
+                "SELECT DISTINCT period FROM performance "
+                "WHERE name IN (?, ?) ORDER BY period",
+                (old_name, new_name),
+            )
+            affected_periods = [row[0] for row in self.cursor.fetchall()]
 
             with self.conn:
                 self.cursor.execute(
@@ -576,15 +687,15 @@ class DatabaseManager:
                     )
                     if self.cursor.rowcount == 0:
                         self._ensure_name_no_commit(new_name, reactivate=True)
+                self._normalize_sort_orders_no_commit(affected_periods)
                 self._recalculate_person_growth_rates_no_commit(new_name)
 
             self.last_error = ""
-            self._run_auto_backup()
-            return True
+            return self._finish_mutation(affected_rows=1)
         except Exception as exc:
             self.last_error = str(exc)
             print(f"重命名人员失败: {exc}")
-            return False
+            return MutationResult(committed=False, error=str(exc))
 
     def update_all_names_from_performance(self):
         self.cursor.execute(
@@ -599,7 +710,7 @@ class DatabaseManager:
                 if self.cursor.fetchone() is None:
                     self._ensure_name_no_commit(name, reactivate=True)
                     added += 1
-        return added
+        return self._finish_mutation(affected_rows=added, run_mirror=bool(added))
 
     def get_data_by_period(self, period):
         canonical_period = self.normalize_period(period)
@@ -671,7 +782,7 @@ class DatabaseManager:
                 """,
                 (canonical_period, str(text or "")),
             )
-        return self._run_auto_backup()
+        return self._finish_mutation(affected_rows=1)
 
     def get_summary(self, period):
         canonical_period = self.normalize_period(period)
@@ -682,6 +793,28 @@ class DatabaseManager:
         result = self.cursor.fetchone()
         return result[0] if result else ""
 
+    def _finish_mutation(
+        self, affected_rows=0, run_mirror=True, pre_import_backup=""
+    ):
+        """Build a committed result without conflating mirror failures."""
+        self.last_error = ""
+        if run_mirror:
+            try:
+                mirror_ok = bool(self._run_auto_backup())
+            except Exception as exc:
+                self.last_backup_error = str(exc)
+                mirror_ok = False
+        else:
+            self.last_backup_error = ""
+            mirror_ok = True
+        return MutationResult(
+            committed=True,
+            mirror_ok=mirror_ok,
+            mirror_error=self.last_backup_error if not mirror_ok else "",
+            affected_rows=affected_rows,
+            pre_import_backup=str(pre_import_backup or ""),
+        )
+
     def _run_auto_backup(self):
         if not self.auto_backup_enabled:
             self.last_backup_error = ""
@@ -689,454 +822,214 @@ class DatabaseManager:
         return self.export_to_csv(self.backup_path)
 
     def export_to_csv(self, csv_file=None):
-        """以原子替换方式导出完整、带版本号的 CSV 备份。"""
+        """Atomically export a raw-only v3 snapshot."""
         target = Path(csv_file) if csv_file is not None else self.backup_path
         target = target.expanduser().resolve()
-        temporary_path = None
         try:
-            self.cursor.execute(
-                """
-                SELECT name, period, left_perf, right_perf, left_orders, right_orders,
-                       left_growth_pct, right_growth_pct, total_growth_pct,
-                       position, sort_order
-                FROM performance
-                ORDER BY period ASC, sort_order ASC, name ASC
-                """
-            )
-            performance_data = self.cursor.fetchall()
-            self.cursor.execute(
-                "SELECT period, summary_text FROM summaries ORDER BY period"
-            )
-            summary_data = self.cursor.fetchall()
-            self.cursor.execute(
-                "SELECT name, created_at, is_active FROM all_names ORDER BY name"
-            )
-            all_names_data = self.cursor.fetchall()
-
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                newline="",
-                encoding="utf-8-sig",
-                dir=str(target.parent),
-                prefix=f".{target.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as temporary_file:
-                temporary_path = Path(temporary_file.name)
-                writer = csv.writer(temporary_file)
-                writer.writerow(["# 业绩数据备份文件"])
-                writer.writerow(["# 格式版本:", self.CSV_FORMAT_VERSION])
-                writer.writerow(["# 导出时间:", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
-                writer.writerow([])
-                writer.writerow(["[PERFORMANCE_DATA]"])
-                writer.writerow(
-                    [
-                        "编号",
-                        "姓名",
-                        "时期",
-                        "左区业绩",
-                        "右区业绩",
-                        "左区订单",
-                        "右区订单",
-                        "左区增长%",
-                        "右区增长%",
-                        "总增长%",
-                        "职级",
-                        "排序",
-                    ]
-                )
-
-                current_period = None
-                period_number = 0
-                for row in performance_data:
-                    (
-                        name,
-                        period,
-                        left_perf,
-                        right_perf,
-                        left_orders,
-                        right_orders,
-                        left_growth,
-                        right_growth,
-                        total_growth,
-                        position,
-                        sort_order,
-                    ) = row
-                    if period != current_period:
-                        current_period = period
-                        period_number = 0
-                    period_number += 1
-                    writer.writerow(
-                        [
-                            period_number,
-                            name,
-                            period,
-                            left_perf,
-                            right_perf,
-                            left_orders,
-                            right_orders,
-                            left_growth,
-                            right_growth,
-                            total_growth,
-                            position,
-                            sort_order,
-                        ]
-                    )
-
-                writer.writerow([])
-                writer.writerow(["[SUMMARY_DATA]"])
-                writer.writerow(["时期", "总结内容"])
-                writer.writerows(summary_data)
-
-                writer.writerow([])
-                writer.writerow(["[ALL_NAMES]"])
-                writer.writerow(["姓名", "创建时间", "是否启用"])
-                writer.writerows(all_names_data)
-
-            os.replace(str(temporary_path), str(target))
+            snapshot = self._snapshot_from_database()
+            CsvCodec.write_snapshot(target, snapshot)
             self.last_backup_error = ""
             print(f"数据已导出到 {target}")
             return True
         except Exception as exc:
             self.last_backup_error = str(exc)
-            if temporary_path and temporary_path.exists():
-                try:
-                    temporary_path.unlink()
-                except OSError:
-                    pass
             print(f"导出CSV失败: {exc}")
             return False
 
-    @staticmethod
-    def _section(rows, marker):
-        marker_indexes = [
-            index
-            for index, row in enumerate(rows)
-            if row and row[0].strip() == marker
-        ]
-        if not marker_indexes:
-            return None, []
-        if len(marker_indexes) > 1:
-            raise ValueError(f"CSV 中重复出现数据段 {marker}")
-        marker_index = marker_indexes[0]
-        if marker_index + 1 >= len(rows):
-            raise ValueError(f"数据段 {marker} 缺少标题行")
-        end = len(rows)
-        for index in range(marker_index + 1, len(rows)):
-            if rows[index] and rows[index][0].strip().startswith("["):
-                end = index
-                break
-        header = [cell.strip() for cell in rows[marker_index + 1]]
-        data_rows = [
-            row
-            for row in rows[marker_index + 2 : end]
-            if any(cell.strip() for cell in row)
-        ]
-        return header, data_rows
-
-    @staticmethod
-    def _column_map(header):
-        aliases = {
-            "number": {"编号", "number"},
-            "name": {"姓名", "name"},
-            "period": {"时期", "period"},
-            "position": {"职级", "position"},
-            "left_perf": {"左区业绩", "left_perf", "left"},
-            "right_perf": {"右区业绩", "right_perf", "right"},
-            "left_orders": {"左区订单", "left_orders"},
-            "right_orders": {"右区订单", "right_orders"},
-            "left_growth": {"左区增长%", "left_growth", "left_growth_pct"},
-            "right_growth": {"右区增长%", "right_growth", "right_growth_pct"},
-            "total_growth": {"总增长%", "total_growth", "total_growth_pct"},
-            "sort_order": {"排序", "sort_order"},
-            "summary": {"总结内容", "summary", "summary_text"},
-            "created_at": {"创建时间", "created_at"},
-            "is_active": {"是否启用", "is_active"},
-        }
-        normalized_header = [cell.strip().lower() for cell in header]
-        result = {}
-        for key, names in aliases.items():
-            normalized_names = {name.lower() for name in names}
-            result[key] = next(
-                (
-                    index
-                    for index, value in enumerate(normalized_header)
-                    if value in normalized_names
-                ),
-                None,
+    def _snapshot_from_database(self):
+        """Read all three tables from one consistent SQLite snapshot."""
+        started_transaction = not self.conn.in_transaction
+        if started_transaction:
+            self.cursor.execute("BEGIN")
+        try:
+            self.cursor.execute(
+                """
+                SELECT name, period, left_perf, right_perf, left_orders, right_orders,
+                       position, sort_order
+                FROM performance
+                ORDER BY period ASC, sort_order ASC, name ASC
+                """
             )
-        return result
-
-    @staticmethod
-    def _cell(row, index, default=""):
-        if index is None or index >= len(row):
-            return default
-        return row[index].strip()
-
-    @staticmethod
-    def _raw_cell(row, index, default=""):
-        if index is None or index >= len(row):
-            return default
-        return row[index]
+            performance = tuple(
+                CsvPerformanceRecord(
+                    name=row[0],
+                    period=row[1],
+                    left_perf=row[2],
+                    right_perf=row[3],
+                    left_orders=row[4],
+                    right_orders=row[5],
+                    position=row[6] or "",
+                    sort_order=row[7],
+                )
+                for row in self.cursor.fetchall()
+            )
+            self.cursor.execute(
+                "SELECT period, summary_text FROM summaries ORDER BY period"
+            )
+            summaries = tuple(
+                CsvSummaryRecord(period=row[0], summary_text=row[1] or "")
+                for row in self.cursor.fetchall()
+            )
+            self.cursor.execute(
+                "SELECT name, created_at, is_active FROM all_names ORDER BY name"
+            )
+            names = tuple(
+                CsvNameRecord(
+                    name=row[0],
+                    created_at=str(row[1] or ""),
+                    is_active=row[2],
+                )
+                for row in self.cursor.fetchall()
+            )
+            return CsvSnapshot(
+                performance=performance,
+                summaries=summaries,
+                names=names,
+            )
+        finally:
+            if started_transaction and self.conn.in_transaction:
+                self.conn.rollback()
 
     def preview_import_csv(self, csv_file=None):
-        """Validate a CSV import without changing the database.
-
-        The returned dictionary is suitable for presenting an import confirmation
-        dialog.  Invalid files are reported through ``valid``/``error`` instead of
-        raising, and this method deliberately leaves ``last_error`` untouched.
-        """
-        return self.import_from_csv(csv_file, _preview=True)
-
-    def import_from_csv(self, csv_file=None, *, _preview=False):
-        """完整校验后再原子替换数据库；兼容旧版 CSV。"""
+        """Parse once without changing the DB or the manager error state."""
         source = Path(csv_file) if csv_file is not None else self.backup_path
-        source = source.expanduser().resolve()
+        return CsvCodec.parse(source)
+
+    def _write_pre_import_snapshot(self):
+        """Persist a unique recovery point before replacing a disk database."""
+        if self.db_path is None:
+            return ""
+        backup_dir = self.data_dir / "backups"
+        filename = "pre_import_{}_{}.csv".format(
+            datetime.now().strftime("%Y%m%d_%H%M%S_%f"), uuid4().hex[:8]
+        )
+        target = backup_dir / filename
+        CsvCodec.write_snapshot(target, self._snapshot_from_database())
+        return str(target)
+
+    def apply_import_plan(self, plan):
+        """Apply the exact parsed snapshot after verifying its source hash."""
+        if not isinstance(plan, ImportPlan):
+            error = "导入计划类型无效，请重新预检文件"
+            self.last_error = error
+            return MutationResult(committed=False, error=error)
+        if not plan.valid or plan.snapshot is None:
+            error = plan.error or "导入计划无效，请重新预检文件"
+            self.last_error = error
+            return MutationResult(committed=False, error=error)
+
         try:
-            if not source.exists():
-                raise ValueError(f"CSV文件不存在: {source}")
-            with source.open("r", encoding="utf-8-sig", newline="") as stream:
-                rows = list(csv.reader(stream))
+            current_hash = CsvCodec.file_sha256(plan.path)
+        except Exception as exc:
+            error = f"无法验证待导入文件：{exc}"
+            self.last_error = error
+            return MutationResult(committed=False, error=error)
+        if current_hash != plan.sha256:
+            error = "CSV 文件在预检后发生变化，请重新预检并确认"
+            self.last_error = error
+            return MutationResult(committed=False, error=error)
 
-            format_version = 1
-            for row in rows:
-                if row and row[0].strip() == "# 格式版本:" and len(row) > 1:
-                    format_version = int(row[1])
+        try:
+            canonical_snapshot = CsvCodec.normalize_snapshot(plan.snapshot)
+        except Exception as exc:
+            error = f"导入计划中的数据无效：{exc}"
+            self.last_error = error
+            return MutationResult(committed=False, error=error)
+        if canonical_snapshot != plan.snapshot:
+            error = "导入计划中的数据不是规范化快照，请重新预检文件"
+            self.last_error = error
+            return MutationResult(committed=False, error=error)
 
-            performance_header, performance_rows = self._section(
-                rows, "[PERFORMANCE_DATA]"
-            )
-            if performance_header is None:
-                raise ValueError("CSV文件格式错误：找不到业绩数据段")
-            columns = self._column_map(performance_header)
-            required = (
-                "name",
-                "period",
-                "left_perf",
-                "right_perf",
-                "left_orders",
-                "right_orders",
-            )
-            missing = [key for key in required if columns[key] is None]
-            if missing:
-                raise ValueError("业绩数据缺少必要列：" + "、".join(missing))
+        try:
+            # This must succeed before the destructive transaction starts.
+            pre_import_backup = self._write_pre_import_snapshot()
+        except Exception as exc:
+            error = f"无法创建导入前快照，当前数据未修改：{exc}"
+            self.last_error = error
+            return MutationResult(committed=False, error=error)
 
-            parsed_performance = []
-            seen_keys = set()
-            period_counters = {}
-            for row_number, row in enumerate(performance_rows, start=1):
-                name = self._clean_name(self._cell(row, columns["name"]))
-                period = self.normalize_period(self._cell(row, columns["period"]))
-                key = (name, period)
-                if key in seen_keys:
-                    raise ValueError(
-                        f"CSV业绩数据存在重复记录：{name} / {self.convert_period_format(period)}"
-                    )
-                seen_keys.add(key)
-
-                period_counters.setdefault(period, 0)
-                number_value = self._cell(row, columns["number"])
-                explicit_order = self._cell(row, columns["sort_order"])
-                if explicit_order != "":
-                    sort_order = self._coerce_int(explicit_order, "排序")
-                elif number_value != "":
-                    sort_order = self._coerce_int(number_value, "编号") - 1
-                else:
-                    sort_order = period_counters[period]
-                period_counters[period] += 1
-
-                parsed_performance.append(
-                    {
-                        "name": name,
-                        "period": period,
-                        "position": self._cell(row, columns["position"]),
-                        "left_perf": self._coerce_float(
-                            self._cell(row, columns["left_perf"]), "左区业绩"
-                        ),
-                        "right_perf": self._coerce_float(
-                            self._cell(row, columns["right_perf"]), "右区业绩"
-                        ),
-                        "left_orders": self._coerce_int(
-                            self._cell(row, columns["left_orders"]), "左区订单"
-                        ),
-                        "right_orders": self._coerce_int(
-                            self._cell(row, columns["right_orders"]), "右区订单"
-                        ),
-                        "left_growth": self._coerce_float(
-                            self._cell(row, columns["left_growth"], 0), "左区增长率"
-                        ),
-                        "right_growth": self._coerce_float(
-                            self._cell(row, columns["right_growth"], 0), "右区增长率"
-                        ),
-                        "total_growth": self._coerce_float(
-                            self._cell(row, columns["total_growth"], 0), "总增长率"
-                        ),
-                        "sort_order": sort_order,
-                        "row_number": row_number,
-                    }
-                )
-
-            summary_header, summary_rows = self._section(rows, "[SUMMARY_DATA]")
-            parsed_summaries = []
-            if summary_header is not None:
-                summary_columns = self._column_map(summary_header)
-                if summary_columns["period"] is None or summary_columns["summary"] is None:
-                    raise ValueError("总结数据缺少时期或总结内容列")
-                seen_summary_periods = set()
-                for row in summary_rows:
-                    period = self.normalize_period(
-                        self._cell(row, summary_columns["period"])
-                    )
-                    if period in seen_summary_periods:
-                        raise ValueError(
-                            f"CSV总结数据存在重复时期：{self.convert_period_format(period)}"
-                        )
-                    seen_summary_periods.add(period)
-                    summary = self._raw_cell(row, summary_columns["summary"])
-                    if format_version < 2:
-                        summary = summary.replace("\\n", "\n").replace("\\r", "\r")
-                    parsed_summaries.append((period, summary))
-
-            names_header, names_rows = self._section(rows, "[ALL_NAMES]")
-            parsed_names = []
-            if names_header is not None:
-                name_columns = self._column_map(names_header)
-                if name_columns["name"] is None:
-                    raise ValueError("人员名册缺少姓名列")
-                seen_names = set()
-                for row in names_rows:
-                    name = self._clean_name(self._cell(row, name_columns["name"]))
-                    if name in seen_names:
-                        raise ValueError(f"CSV人员名册存在重复姓名：{name}")
-                    seen_names.add(name)
-                    active_text = self._cell(row, name_columns["is_active"], "1")
-                    is_active = self._coerce_int(active_text, "是否启用")
-                    if is_active not in (0, 1):
-                        raise ValueError("是否启用只能是 0 或 1")
-                    parsed_names.append(
-                        (
-                            name,
-                            self._cell(row, name_columns["created_at"]),
-                            is_active,
-                        )
-                    )
-
-            if _preview:
-                warnings = []
-                if format_version < self.CSV_FORMAT_VERSION:
-                    warnings.append(
-                        f"旧版 CSV（版本 {format_version}），导入时将按兼容规则转换"
-                    )
-                elif format_version > self.CSV_FORMAT_VERSION:
-                    warnings.append(
-                        f"CSV 版本 {format_version} 高于当前支持版本 "
-                        f"{self.CSV_FORMAT_VERSION}，未知扩展字段将被忽略"
-                    )
-                if summary_header is None:
-                    warnings.append("文件未包含总结数据段")
-                if names_header is None:
-                    warnings.append("文件未包含人员名册，导入时将从业绩记录生成")
-                if columns["position"] is None:
-                    warnings.append("文件未包含职级列，将使用空值")
-                if columns["sort_order"] is None and columns["number"] is None:
-                    warnings.append("文件未包含排序列，将按记录出现顺序排序")
-
-                effective_names = {item["name"] for item in parsed_performance}
-                effective_names.update(item[0] for item in parsed_names)
-                return {
-                    "valid": True,
-                    "path": str(source),
-                    "format_version": format_version,
-                    "performance_count": len(parsed_performance),
-                    "summary_count": len(parsed_summaries),
-                    "name_count": len(effective_names),
-                    "warnings": warnings,
-                    "error": "",
-                }
-
+        snapshot = canonical_snapshot
+        try:
             with self.conn:
                 self.cursor.execute("DELETE FROM performance")
                 self.cursor.execute("DELETE FROM summaries")
                 self.cursor.execute("DELETE FROM all_names")
 
-                for record in parsed_performance:
-                    self.cursor.execute(
-                        """
-                        INSERT INTO performance
-                        (name, period, left_perf, right_perf, left_orders, right_orders,
-                         left_growth_pct, right_growth_pct, total_growth_pct,
-                         position, sort_order)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
+                self.cursor.executemany(
+                    """
+                    INSERT INTO performance
+                    (name, period, left_perf, right_perf, left_orders, right_orders,
+                     left_growth_pct, right_growth_pct, total_growth_pct,
+                     position, sort_order)
+                    VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?)
+                    """,
+                    [
                         (
-                            record["name"],
-                            record["period"],
-                            record["left_perf"],
-                            record["right_perf"],
-                            record["left_orders"],
-                            record["right_orders"],
-                            record["left_growth"],
-                            record["right_growth"],
-                            record["total_growth"],
-                            record["position"],
-                            record["sort_order"],
-                        ),
-                    )
-
+                            record.name,
+                            record.period,
+                            record.left_perf,
+                            record.right_perf,
+                            record.left_orders,
+                            record.right_orders,
+                            record.position,
+                            record.sort_order,
+                        )
+                        for record in snapshot.performance
+                    ],
+                )
                 self.cursor.executemany(
                     "INSERT INTO summaries (period, summary_text) VALUES (?, ?)",
-                    parsed_summaries,
+                    [
+                        (summary.period, summary.summary_text)
+                        for summary in snapshot.summaries
+                    ],
                 )
-
-                for name, created_at, is_active in parsed_names:
-                    if created_at:
+                for person in snapshot.names:
+                    if person.created_at:
                         self.cursor.execute(
-                            "INSERT INTO all_names (name, created_at, is_active) VALUES (?, ?, ?)",
-                            (name, created_at, is_active),
+                            "INSERT INTO all_names (name, created_at, is_active) "
+                            "VALUES (?, ?, ?)",
+                            (person.name, person.created_at, person.is_active),
                         )
                     else:
                         self.cursor.execute(
                             "INSERT INTO all_names (name, is_active) VALUES (?, ?)",
-                            (name, is_active),
+                            (person.name, person.is_active),
                         )
-
-                for name in sorted({item["name"] for item in parsed_performance}):
-                    self.cursor.execute(
-                        "INSERT OR IGNORE INTO all_names (name, is_active) VALUES (?, 1)",
-                        (name,),
-                    )
-
+                self._normalize_sort_orders_no_commit()
                 self._recalculate_all_growth_rates_no_commit()
-
-            self.last_error = ""
-            self._run_auto_backup()
-            print(
-                "导入完成: "
-                f"{len(parsed_performance)}条业绩记录, "
-                f"{len(parsed_summaries)}条总结记录, "
-                f"{len(parsed_names)}条名册记录"
-            )
-            return True
         except Exception as exc:
-            if _preview:
-                return {
-                    "valid": False,
-                    "path": str(source),
-                    "format_version": None,
-                    "performance_count": 0,
-                    "summary_count": 0,
-                    "name_count": 0,
-                    "warnings": [],
-                    "error": str(exc),
-                }
             self.last_error = str(exc)
             print(f"导入CSV失败: {exc}")
-            return False
+            return MutationResult(
+                committed=False,
+                error=str(exc),
+                pre_import_backup=pre_import_backup,
+            )
+
+        print(
+            "导入完成: "
+            f"{plan.performance_count}条业绩记录, "
+            f"{plan.summary_count}条总结记录, "
+            f"{plan.name_count}条名册记录"
+        )
+        return self._finish_mutation(
+            affected_rows=plan.performance_count,
+            pre_import_backup=pre_import_backup,
+        )
+
+    def import_from_csv(self, csv_file=None):
+        """Compatibility wrapper: preview once, then apply that exact plan."""
+        plan = self.preview_import_csv(csv_file)
+        return self.apply_import_plan(plan)
 
     def auto_backup_to_csv(self):
         backup_file = self.data_dir / (
-            "backup_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".csv"
+            "backup_"
+            + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            + "_"
+            + uuid4().hex[:8]
+            + ".csv"
         )
         return self.export_to_csv(backup_file)
 

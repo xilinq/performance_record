@@ -24,7 +24,15 @@
 """
 
 import sys
+import tempfile
 from pathlib import Path
+
+from runtime_bootstrap import configure_windows_runtime
+
+
+# Must run before importing PyQt5, Matplotlib, or NumPy.  Keeping the handles
+# alive prevents Python 3.8 from removing the registered DLL directories.
+_RUNTIME_DLL_HANDLES = configure_windows_runtime()
 
 # 确保可以导入项目模块
 project_root = Path(__file__).parent
@@ -36,6 +44,48 @@ def get_application_data_dir():
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return project_root.resolve()
+
+
+def ensure_data_directory_writable(data_dir):
+    """确认数据目录可写；探针文件会立即删除，不接触业务数据。"""
+    directory = Path(data_dir).expanduser().resolve()
+    probe_path = None
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        if not directory.is_dir():
+            raise OSError("目标路径不是目录")
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=str(directory),
+            prefix=".performance_record_write_probe_",
+            suffix=".tmp",
+            delete=False,
+        ) as probe:
+            probe_path = Path(probe.name)
+            probe.write(b"ok")
+            probe.flush()
+        probe_path.unlink()
+        probe_path = None
+    except Exception as exc:
+        raise RuntimeError(f"数据目录不可写：{directory}\n{exc}") from exc
+    finally:
+        if probe_path is not None and probe_path.exists():
+            try:
+                probe_path.unlink()
+            except OSError:
+                pass
+    return directory
+
+
+def acquire_instance_lock(data_dir):
+    """按数据目录加进程锁，避免两个实例同时覆盖同一份数据。"""
+    from PyQt5.QtCore import QLockFile
+
+    lock_path = Path(data_dir) / ".performance_record.lock"
+    lock = QLockFile(str(lock_path))
+    if not lock.tryLock(0):
+        raise RuntimeError("业绩追踪系统已在运行，请先关闭已有实例。")
+    return lock
 
 
 def show_fatal_error(message):
@@ -89,10 +139,14 @@ def main():
         show_fatal_error(f"模块导入失败：{e}\n请确保所有必要文件都在正确位置。")
         return 1
     
+    db_manager = None
+    instance_lock = None
+    smoke_temp_dir = None
+
     # 启动PyQt应用
     try:
-        from PyQt5.QtCore import QTimer, Qt
-        from PyQt5.QtWidgets import QApplication
+        from PyQt5.QtCore import QSettings, QTimer, Qt
+        from PyQt5.QtWidgets import QApplication, QMessageBox
         from ui.theme import apply_theme
 
         # Qt5 高 DPI 属性必须在 QApplication 创建前设置；兼容 Win7/Win11。
@@ -110,20 +164,31 @@ def main():
         # 设置应用图标（如果有的话）
         # app.setWindowIcon(QIcon("icon.png"))
         
-        print("\n初始化数据库...")
-        # 创建数据库管理器
-        db_manager = (
-            DatabaseManager(":memory:", auto_backup=False)
-            if smoke_test
-            else DatabaseManager(get_application_data_dir() / "performance.db")
-        )
-        smoke_temp_dir = None
         if smoke_test:
-            import tempfile
-
+            # 打包冒烟测试必须完全隔离，不能在仓库或真实数据目录落锁/探针。
             smoke_temp_dir = tempfile.TemporaryDirectory()
+            runtime_data_dir = Path(smoke_temp_dir.name)
+        else:
+            runtime_data_dir = get_application_data_dir()
+        runtime_data_dir = ensure_data_directory_writable(runtime_data_dir)
+        instance_lock = acquire_instance_lock(runtime_data_dir)
+
+        print("\n初始化数据库...")
+        db_manager = (
+            DatabaseManager(runtime_data_dir / "smoke_performance.db", auto_backup=False)
+            if smoke_test
+            else DatabaseManager(runtime_data_dir / "performance.db")
+        )
+        if smoke_test:
+            # Exercise the native NumPy path that previously terminated with
+            # 0xC06D007F when Conda DLL discovery was incomplete.
+            import numpy as np
+
+            native_product = np.ones((2, 2)) @ np.ones((2, 2))
+            if float(native_product[0, 0]) != 2.0:
+                raise RuntimeError("打包冒烟测试 NumPy 原生矩阵运算失败")
             smoke_period = "2026-01-上"
-            db_manager.save_period_bundle(
+            save_result = db_manager.save_period_bundle(
                 smoke_period,
                 [
                     {
@@ -137,22 +202,48 @@ def main():
                 ],
                 "packaged smoke test",
             )
+            if not save_result:
+                raise RuntimeError("打包冒烟测试保存数据失败")
             smoke_csv = Path(smoke_temp_dir.name) / "smoke.csv"
             if not db_manager.export_to_csv(smoke_csv):
                 raise RuntimeError("打包冒烟测试导出 CSV 失败")
-            preview = db_manager.preview_import_csv(smoke_csv)
-            if not preview.get("valid") or preview.get("performance_count") != 1:
+            import_plan = db_manager.preview_import_csv(smoke_csv)
+            if not import_plan.get("valid") or import_plan.get("performance_count") != 1:
                 raise RuntimeError("打包冒烟测试 CSV 预检失败")
-            if not db_manager.import_from_csv(smoke_csv):
+            if not db_manager.apply_import_plan(import_plan):
                 raise RuntimeError("打包冒烟测试导入 CSV 失败")
         
         print("创建主窗口...")
         # 创建主窗口
-        main_window = MainWindow(db_manager)
+        smoke_settings = (
+            QSettings(
+                str(runtime_data_dir / "smoke_settings.ini"),
+                QSettings.IniFormat,
+            )
+            if smoke_test
+            else None
+        )
+        main_window = MainWindow(db_manager, settings=smoke_settings)
         main_window.show()
+        startup_mirror_error = str(db_manager.last_backup_error or "")
+        if startup_mirror_error:
+            main_window.show_status_message("SQLite 已打开，但 CSV 镜像更新失败", 8000)
+            QTimer.singleShot(
+                0,
+                lambda detail=startup_mirror_error: QMessageBox.warning(
+                    main_window,
+                    "CSV 镜像更新失败",
+                    "SQLite 主库已正常打开，但自动 CSV 镜像未能更新：\n\n"
+                    + detail,
+                ),
+            )
         if smoke_test:
             main_window.tabs.setCurrentIndex(1)
-            main_window.charts_tab.generate_chart()
+            main_window.charts_tab.chart_type_combo.setCurrentIndex(1)
+            if main_window.charts_tab.last_chart_state != "ready":
+                raise RuntimeError(
+                    "打包冒烟测试图表失败：" + main_window.charts_tab.last_error
+                )
             QTimer.singleShot(300, app.quit)
         
         print("系统启动成功！")
@@ -164,9 +255,7 @@ def main():
         
         # 运行应用主循环
         exit_code = app.exec_()
-        db_manager.close()
-        if smoke_temp_dir is not None:
-            smoke_temp_dir.cleanup()
+        main_window.close()
         return exit_code
         
     except Exception as e:
@@ -181,6 +270,22 @@ def main():
         except Exception:
             pass
         return 1
+    finally:
+        if db_manager is not None:
+            try:
+                db_manager.close()
+            except Exception:
+                pass
+        if instance_lock is not None:
+            try:
+                instance_lock.unlock()
+            except Exception:
+                pass
+        if smoke_temp_dir is not None:
+            try:
+                smoke_temp_dir.cleanup()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     sys.exit(main())

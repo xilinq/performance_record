@@ -1,5 +1,13 @@
-from PyQt5.QtCore import QDate, QSignalBlocker, Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QDoubleValidator, QIntValidator, QKeySequence
+import math
+import sys
+
+from PyQt5.QtCore import QDate, QLocale, QSignalBlocker, Qt, pyqtSignal
+from PyQt5.QtGui import (
+    QColor,
+    QDoubleValidator,
+    QKeySequence,
+    QValidator,
+)
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -30,6 +38,93 @@ except ImportError:  # 支持直接运行本文件
     from rename_person_dialog import RenamePersonDialog
 
 
+SQLITE_INT64_MIN = -(2 ** 63)
+SQLITE_INT64_MAX = 2 ** 63 - 1
+
+
+def _numeric_locale():
+    """Return the locale shared by editors and value parsing.
+
+    Business data always uses a dot as decimal separator.  Rejecting group
+    separators also prevents a value accepted by Qt (for example ``1,234`` in
+    a Chinese locale) from later being rejected by Python/CSV parsing.
+    """
+
+    locale = QLocale.c()
+    locale.setNumberOptions(locale.numberOptions() | QLocale.RejectGroupSeparator)
+    return locale
+
+
+class Int64Validator(QValidator):
+    """Qt5 validator for SQLite's full signed 64-bit integer range."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setLocale(_numeric_locale())
+
+    def validate(self, input_text, position):
+        text = str(input_text)
+        if text in ("", "+", "-"):
+            return QValidator.Intermediate, input_text, position
+        digits = text[1:] if text[0] in "+-" else text
+        if not digits or not digits.isascii() or not digits.isdigit():
+            return QValidator.Invalid, input_text, position
+        try:
+            value = int(text, 10)
+        except ValueError:
+            return QValidator.Invalid, input_text, position
+        state = (
+            QValidator.Acceptable
+            if SQLITE_INT64_MIN <= value <= SQLITE_INT64_MAX
+            else QValidator.Invalid
+        )
+        return state, input_text, position
+
+
+def _numeric_validator(integer=False, parent=None):
+    if integer:
+        validator = Int64Validator(parent)
+    else:
+        validator = QDoubleValidator(parent)
+        # -1 means unlimited decimal places in Qt 5.  Counting leading zeroes
+        # against a fixed precision would reject valid repr values such as
+        # 0.00012345678901234567.
+        validator.setRange(-sys.float_info.max, sys.float_info.max, -1)
+        # repr(float) may use exponent notation; accepting it is required for
+        # a lossless round trip of very large and very small imported values.
+        validator.setNotation(QDoubleValidator.ScientificNotation)
+    validator.setLocale(_numeric_locale())
+    return validator
+
+
+def _parse_numeric_text(text, integer=False):
+    value_text = str(text).strip()
+    validator = _numeric_validator(integer)
+    if validator.validate(value_text, 0)[0] != QValidator.Acceptable:
+        raise ValueError
+    if integer:
+        value, valid = validator.locale().toLongLong(value_text)
+    else:
+        value, valid = validator.locale().toDouble(value_text)
+        valid = valid and math.isfinite(value)
+    if not valid:
+        raise ValueError
+    return value
+
+
+def _mutation_status(result):
+    """Read the new mutation contract while accepting legacy bool stubs."""
+
+    legacy = bool(result)
+    committed = bool(getattr(result, "committed", legacy))
+    mirror_ok = bool(getattr(result, "mirror_ok", legacy))
+    return committed, mirror_ok
+
+
+def _mutation_error(result, attribute, fallback=""):
+    return str(getattr(result, attribute, "") or fallback or "")
+
+
 class NumericDelegate(QStyledItemDelegate):
     """为业绩和订单列提供兼容 Qt5 的数值编辑器。"""
 
@@ -39,13 +134,7 @@ class NumericDelegate(QStyledItemDelegate):
 
     def createEditor(self, parent, option, index):
         editor = QLineEdit(parent)
-        if self.integer:
-            editor.setValidator(QIntValidator(-2147483648, 2147483647, editor))
-        else:
-            validator = QDoubleValidator(editor)
-            validator.setNotation(QDoubleValidator.StandardNotation)
-            validator.setDecimals(6)
-            editor.setValidator(validator)
+        editor.setValidator(_numeric_validator(self.integer, editor))
         return editor
 
 
@@ -123,6 +212,8 @@ class DataEntryTab(QWidget):
         self._loaded_person = ""
         self._active_internal_tab = 0
         self._person_deleted_periods = set()
+        self._period_view_stale = False
+        self._person_view_stale = False
         self._shortcuts = []
         self.init_ui()
 
@@ -338,6 +429,37 @@ class DataEntryTab(QWidget):
     def has_unsaved_changes(self):
         return self._period_dirty or self._person_dirty
 
+    @staticmethod
+    def _view_names(views):
+        selected = set(views or ("period", "person"))
+        unknown = selected.difference(("period", "person"))
+        if unknown:
+            raise ValueError("未知数据视图：" + "、".join(sorted(unknown)))
+        return selected
+
+    def invalidate_views(self, *views):
+        """Mark one or both cached data views for reload on next activation."""
+
+        selected = self._view_names(views)
+        if "period" in selected:
+            self._period_view_stale = True
+        if "person" in selected:
+            self._person_view_stale = True
+
+    def refresh_views(
+        self, *views, preferred_person=None, preserve_person=True
+    ):
+        """Reload cached views after callers have resolved pending edits."""
+
+        selected = self._view_names(views)
+        if "period" in selected:
+            self.load_period_data()
+        if "person" in selected:
+            self.refresh_person_list(
+                preferred_person, preserve_current=preserve_person
+            )
+            self.load_person_data()
+
     def _update_dirty_state(self):
         self.period_dirty_label.setText("有未保存更改" if self._period_dirty else "已保存")
         self.period_dirty_label.setProperty("state", "dirty" if self._period_dirty else "clean")
@@ -375,7 +497,7 @@ class DataEntryTab(QWidget):
         box.setIcon(QMessageBox.Warning)
         box.setWindowTitle("存在未保存更改")
         box.setText(f"{subject}的数据尚未保存。")
-        box.setInformativeText("请选择保存、更改后放弃，或取消当前操作。")
+        box.setInformativeText("请选择保存、放弃更改，或取消当前操作。")
         save_button = box.addButton("保存", QMessageBox.AcceptRole)
         discard_button = box.addButton("放弃更改", QMessageBox.DestructiveRole)
         cancel_button = box.addButton("取消", QMessageBox.RejectRole)
@@ -412,9 +534,17 @@ class DataEntryTab(QWidget):
         self.tabs.setCurrentIndex(index)
         del blocker
         self._active_internal_tab = index
-        if index == 1:
-            self.refresh_person_list(self._loaded_person)
-            self.load_person_data()
+        if index == 0:
+            if self._period_view_stale:
+                self.refresh_views("period")
+        else:
+            # The name registry can change while this page is hidden, so keep
+            # the previous behavior of refreshing it whenever the page opens.
+            self.refresh_views(
+                "person",
+                preferred_person=self._loaded_person,
+                preserve_person=False,
+            )
 
     def _set_period_controls(self, period):
         if not period:
@@ -435,14 +565,16 @@ class DataEntryTab(QWidget):
             self._set_period_controls(latest_period)
 
     def navigate_to_latest_period(self):
+        # Saving the current dirty page can itself create a new latest period.
+        # Resolve it first, then query the authoritative store exactly once.
+        if self._period_dirty and not self._resolve_dirty("period"):
+            return
         requested = self.db.get_latest_performance_period()
         if not requested:
             self.statusMessage.emit("暂无已保存时期", 3000)
             return
         requested = self.db.convert_period_format(requested)
         if requested == self._loaded_period:
-            return
-        if self._period_dirty and not self._resolve_dirty("period"):
             return
         self._set_period_controls(requested)
         self.load_period_data()
@@ -483,7 +615,13 @@ class DataEntryTab(QWidget):
         elif integer:
             text = str(int(value))
         else:
-            text = f"{float(value):.2f}"
+            numeric = float(value)
+            if not math.isfinite(numeric):
+                raise ValueError("业绩不能是 NaN 或无穷大")
+            # Python's repr is the shortest representation that round-trips to
+            # the exact same binary float; formatting to two decimals here
+            # would silently alter data when an unrelated field is saved.
+            text = repr(numeric)
         item = QTableWidgetItem(text)
         item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         return item
@@ -524,6 +662,7 @@ class DataEntryTab(QWidget):
                 self.add_row(mark_dirty=False)
             self.summary_text.setPlainText(summary or "")
             self._loaded_period = period
+            self._period_view_stale = False
         finally:
             self._loading = False
         self._set_period_dirty(False)
@@ -553,15 +692,35 @@ class DataEntryTab(QWidget):
             self.statusMessage.emit(f"人员“{new_name}”已存在", 3000)
             self.new_person_input.clear()
             return
-        if not self.db.add_name_to_all_names(new_name):
-            QMessageBox.critical(self, "添加失败", f"无法添加人员“{new_name}”。")
+        mutation = self.db.add_name_to_all_names(new_name)
+        committed, mirror_ok = _mutation_status(mutation)
+        if not committed:
+            detail = _mutation_error(
+                mutation, "error", getattr(self.db, "last_error", "")
+            )
+            QMessageBox.critical(
+                self,
+                "添加失败",
+                f"无法添加人员“{new_name}”。"
+                + (f"\n\n{detail}" if detail else ""),
+            )
             return
         self.new_person_input.clear()
         self.refresh_name_combos()
-        self.refresh_person_list(new_name)
+        self.invalidate_views("person")
+        self.refresh_views(
+            "person", preferred_person=new_name, preserve_person=False
+        )
         self.statusMessage.emit(f"已添加人员“{new_name}”", 4000)
-        if self.db.last_backup_error:
-            QMessageBox.warning(self, "备份失败", self.db.last_backup_error)
+        mirror_error = _mutation_error(
+            mutation,
+            "mirror_error",
+            getattr(self.db, "last_backup_error", ""),
+        )
+        if not mirror_ok or mirror_error:
+            QMessageBox.warning(
+                self, "CSV 镜像更新失败", mirror_error or "人员已添加，但 CSV 镜像未更新。"
+            )
 
     def _current_period_row_name(self):
         row = self.table.currentRow()
@@ -576,9 +735,10 @@ class DataEntryTab(QWidget):
             initial_name = self.person_combo.currentText().strip()
         dialog = RenamePersonDialog(self, self.db, initial_name=initial_name)
         if dialog.exec_() == QDialog.Accepted and dialog.rename_succeeded:
-            self.load_period_data()
-            self.refresh_name_combos()
-            self.refresh_person_list(dialog.new_name)
+            self.invalidate_views()
+            self.refresh_views(
+                preferred_person=dialog.new_name, preserve_person=False
+            )
             self.statusMessage.emit(f"已将“{dialog.old_name}”重命名为“{dialog.new_name}”", 5000)
 
     def refresh_name_combos(self):
@@ -621,7 +781,9 @@ class DataEntryTab(QWidget):
         valid = True
         if text:
             try:
-                float(text) if item.column() in performance_columns else int(text)
+                _parse_numeric_text(
+                    text, integer=item.column() in order_columns
+                )
             except ValueError:
                 valid = False
         self._validation_guard = True
@@ -647,6 +809,8 @@ class DataEntryTab(QWidget):
         if not text:
             return 0
         try:
+            if cast in (float, int):
+                return _parse_numeric_text(text, integer=cast is int)
             return cast(text)
         except ValueError:
             raise ValueError(f"第 {row + 1} 行“{table.horizontalHeaderItem(column).text()}”格式无效")
@@ -678,19 +842,44 @@ class DataEntryTab(QWidget):
                     "right_perf": self._read_number(self.table, row, 4, float),
                     "right_orders": self._read_number(self.table, row, 5, int),
                 })
-            backup_ok = self.db.save_period_bundle(period, records, self.summary_text.toPlainText())
+            mutation = self.db.save_period_bundle(
+                period, records, self.summary_text.toPlainText()
+            )
         except ValueError as exc:
             QMessageBox.warning(self, "数据格式错误", str(exc))
             return False
         except Exception as exc:
             QMessageBox.critical(self, "保存失败", f"保存数据时发生错误：{exc}")
             return False
+        committed, mirror_ok = _mutation_status(mutation)
+        if not committed:
+            detail = _mutation_error(
+                mutation, "error", getattr(self.db, "last_error", "")
+            )
+            QMessageBox.critical(
+                self,
+                "保存失败",
+                "当前时期的数据未保存。" + (f"\n\n{detail}" if detail else ""),
+            )
+            return False
         self._set_period_dirty(False)
+        if hasattr(self, "invalidate_views"):
+            self.invalidate_views("person")
         self.load_period_data()
         self.refresh_name_combos()
         self.statusMessage.emit(f"已保存 {period} 的 {len(records)} 条记录", 5000)
-        if not backup_ok:
-            QMessageBox.warning(self, "备份失败", "数据已保存，但自动备份失败：\n" + self.db.last_backup_error)
+        mirror_error = _mutation_error(
+            mutation,
+            "mirror_error",
+            getattr(self.db, "last_backup_error", ""),
+        )
+        if not mirror_ok or mirror_error:
+            QMessageBox.warning(
+                self,
+                "CSV 镜像更新失败",
+                "数据已保存，但 CSV 镜像更新失败：\n"
+                + (mirror_error or "未知错误"),
+            )
         return True
 
     def move_row_up(self):
@@ -747,9 +936,11 @@ class DataEntryTab(QWidget):
         self.person_combo.clear()
         self.person_combo.addItems(names)
         if current:
-            if current not in names:
+            if current in names:
+                self.person_combo.setCurrentText(current)
+            elif preserve_current:
                 self.person_combo.addItem(current)
-            self.person_combo.setCurrentText(current)
+                self.person_combo.setCurrentText(current)
         del blocker
 
     def _on_person_requested(self, requested=None):
@@ -812,14 +1003,25 @@ class DataEntryTab(QWidget):
                     self._insert_person_row(row_data=row_data)
             self._loaded_person = name
             self._person_deleted_periods.clear()
+            self._person_view_stale = False
         finally:
             self._loading = False
         self._set_person_dirty(False)
 
     def _suggest_next_period(self):
+        canonical_periods = []
         if self.person_table.rowCount():
-            item = self.person_table.item(self.person_table.rowCount() - 1, 0)
-            current = item.text().strip() if item else ""
+            for row in range(self.person_table.rowCount()):
+                item = self.person_table.item(row, 0)
+                value = item.text().strip() if item else ""
+                if not value:
+                    continue
+                try:
+                    canonical_periods.append(self.db.normalize_period(value))
+                except (TypeError, ValueError):
+                    continue
+        if canonical_periods:
+            current = self.db.convert_period_format(max(canonical_periods))
         else:
             latest = self.db.get_latest_performance_period()
             current = self.db.convert_period_format(latest) if latest else ""
@@ -831,6 +1033,8 @@ class DataEntryTab(QWidget):
             month += 1
             if month == 13:
                 year, month = year + 1, 1
+            if year > 2099:
+                return None
             return f"{year}-{month:02d}-上"
         except (ValueError, IndexError):
             return None
@@ -839,7 +1043,15 @@ class DataEntryTab(QWidget):
         if not self.person_combo.currentText().strip():
             QMessageBox.warning(self, "未选择人员", "请先选择或输入人员姓名。")
             return
-        dialog = PeriodPickerDialog(self, self._suggest_next_period())
+        suggested_period = self._suggest_next_period()
+        if self.person_table.rowCount() and suggested_period is None:
+            QMessageBox.warning(
+                self,
+                "无法新增时期",
+                "该人员已达到支持的最后时期 2099-12-下。",
+            )
+            return
+        dialog = PeriodPickerDialog(self, suggested_period)
         if dialog.exec_() != QDialog.Accepted:
             return
         period = dialog.selected_period()
@@ -934,38 +1146,61 @@ class DataEntryTab(QWidget):
                 })
             deleted_periods = getattr(self, "_person_deleted_periods", set())
             if deleted_periods:
-                backup_ok = self.db.save_person_records(
+                mutation = self.db.save_person_records(
                     name, records, deleted_periods=sorted(deleted_periods)
                 )
             else:
-                backup_ok = self.db.save_person_records(name, records)
+                mutation = self.db.save_person_records(name, records)
         except ValueError as exc:
             QMessageBox.critical(self, "输入错误", f"数据格式错误：{exc}")
             return False
         except Exception as exc:
             QMessageBox.critical(self, "保存失败", f"保存数据时发生错误：{exc}")
             return False
+        committed, mirror_ok = _mutation_status(mutation)
+        if not committed:
+            detail = _mutation_error(
+                mutation, "error", getattr(self.db, "last_error", "")
+            )
+            QMessageBox.critical(
+                self,
+                "保存失败",
+                "当前人员的数据未保存。" + (f"\n\n{detail}" if detail else ""),
+            )
+            return False
         if hasattr(self, "_set_person_dirty"):
             self._set_person_dirty(False)
+        if hasattr(self, "invalidate_views"):
+            self.invalidate_views("period")
         if hasattr(self, "refresh_person_list"):
             self.refresh_person_list(name)
         self.load_person_data()
         if hasattr(self, "statusMessage"):
             self.statusMessage.emit(f"已保存 {name} 的 {len(records)} 条记录", 5000)
-        if not backup_ok:
-            QMessageBox.warning(self, "备份失败", "数据已保存，但自动备份失败：\n" + self.db.last_backup_error)
+        mirror_error = _mutation_error(
+            mutation,
+            "mirror_error",
+            getattr(self.db, "last_backup_error", ""),
+        )
+        if not mirror_ok or mirror_error:
+            QMessageBox.warning(
+                self,
+                "CSV 镜像更新失败",
+                "数据已保存，但 CSV 镜像更新失败：\n"
+                + (mirror_error or "未知错误"),
+            )
         return True
 
     def reload_current_view(self):
         kind = "period" if self.tabs.currentIndex() == 0 else "person"
         dirty = self._period_dirty if kind == "period" else self._person_dirty
         if dirty:
-            reply = QMessageBox.question(
-                self, "放弃更改", "重新加载将放弃当前未保存更改，是否继续？",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
+            # Reuse the same save/discard/cancel flow as navigation and close.
+            # Both save and discard reload the selected view, so do not issue a
+            # second query here.
+            if not self._resolve_dirty(kind):
                 return False
+            return True
         self.load_period_data() if kind == "period" else self.load_person_data()
         self.statusMessage.emit("已重新加载当前数据", 3000)
         return True
