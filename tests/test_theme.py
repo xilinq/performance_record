@@ -5,7 +5,7 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtGui import QPalette
-from PyQt5.QtWidgets import QApplication, QFrame, QLabel, QPushButton
+from PyQt5.QtWidgets import QApplication, QFrame, QLabel, QPushButton, QToolButton
 
 from ui.theme import APP_STYLE_SHEET, FONT_FALLBACKS, apply_theme
 
@@ -65,6 +65,26 @@ class ThemeTests(unittest.TestCase):
 
         self.assertNotIn("transform", APP_STYLE_SHEET.casefold())
         self.assertIn("alternate-background-color", APP_STYLE_SHEET)
+
+    def test_navigation_toolbar_table_combo_and_scrollbar_styles_exist(self):
+        apply_theme(self.app)
+        tool_button = QToolButton()
+        tool_button.setCheckable(True)
+        tool_button.setChecked(True)
+        tool_button.style().unpolish(tool_button)
+        tool_button.style().polish(tool_button)
+
+        for selector in (
+            "QTabWidget#mainNavigationTabs::pane",
+            "QTabBar#mainNavigationTabBar::tab",
+            "QTabWidget#dataManagementTabs::pane",
+            "QToolButton:hover",
+            "QTableWidget QComboBox",
+            "QTableWidget:focus",
+            "QScrollBar::handle:vertical",
+            "QScrollBar::handle:horizontal",
+        ):
+            self.assertIn(selector, APP_STYLE_SHEET)
 
 
 if __name__ == "__main__":

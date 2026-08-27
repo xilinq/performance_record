@@ -8,6 +8,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtCore import QSettings
+from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication
 
 from ui.charts_tab import ChartsTab
@@ -108,6 +109,119 @@ class ChartsTabTests(unittest.TestCase):
         self.assertEqual([label.get_text() for label in axis.get_yticklabels()], ["张三", "李四"])
         self.assertEqual([bar.get_width() for bar in axis.patches], [10.0, 30.0, 20.0, 40.0])
         self.assertTrue(all(abs(bar.get_height() - 0.36) < 0.001 for bar in axis.patches))
+        self.assertEqual([bar.get_hatch() for bar in axis.patches], ["///", "///", "...", "..."])
+        self.assertTrue(all(bar.get_linewidth() > 0 for bar in axis.patches))
+        legend_anchor = axis.get_legend().get_bbox_to_anchor()._bbox
+        self.assertGreaterEqual(legend_anchor.y0, 1.0)
+
+    def test_non_negative_trend_has_zero_baseline_and_distinct_series(self):
+        widget = self.make_widget()
+
+        axis = widget.figure.axes[0]
+        series = axis.lines[:3]
+        self.assertEqual(axis.get_ylim()[0], 0)
+        self.assertEqual([line.get_linestyle() for line in series], ["-", "--", "-."])
+        self.assertEqual([line.get_marker() for line in series], ["o", "^", "s"])
+        self.assertEqual(
+            [text.get_text() for text in axis.get_legend().get_texts()],
+            ["左区业绩", "右区业绩", "总业绩"],
+        )
+        self.assertEqual(axis.get_legend()._loc, 2)
+
+    def test_font_settings_have_minimum_eight_and_redraw_once_after_debounce(self):
+        widget = self.make_widget()
+        self.assertEqual(min(int(value) for value in widget.FONT_SIZES), 8)
+        self.assertEqual(widget.canvas.minimumHeight(), widget.BASE_CANVAS_HEIGHT)
+
+        with patch.object(widget.canvas, "draw_idle") as draw_idle:
+            widget.data_font_size_combo.setCurrentText("12")
+            widget.xlabel_font_size_combo.setCurrentText("14")
+            self.assertEqual(draw_idle.call_count, 0)
+            QTest.qWait(widget.FONT_REDRAW_DELAY_MS + 50)
+
+        self.assertEqual(draw_idle.call_count, 1)
+
+    def test_many_people_use_tall_scrollable_canvas_and_keep_all_labels(self):
+        database = FakeChartDatabase()
+        people = ["人员{:02d}".format(index) for index in range(30)]
+        database.period_rows[database.periods[0]] = [
+            (name, index + 1, (index + 1) * 2) for index, name in enumerate(people)
+        ]
+        widget = self.make_widget(database)
+        widget.resize(640, 420)
+        widget.show()
+        widget.chart_type_combo.setCurrentIndex(1)
+        QTest.qWait(50)
+
+        expected_height = (
+            widget.COMPARISON_VERTICAL_PADDING + len(people) * widget.COMPARISON_ROW_HEIGHT
+        )
+        axis = widget.figure.axes[0]
+        self.assertEqual(widget.canvas.minimumHeight(), expected_height)
+        self.assertGreater(widget.chart_scroll_area.verticalScrollBar().maximum(), 0)
+        self.assertEqual([label.get_text() for label in axis.get_yticklabels()], people)
+        self.assertEqual(len(axis.texts), len(people) * 2)
+
+        widget.chart_type_combo.setCurrentIndex(0)
+        QTest.qWait(20)
+        self.assertEqual(widget.canvas.minimumHeight(), widget.BASE_CANVAS_HEIGHT)
+        self.assertEqual(widget.chart_scroll_area.verticalScrollBar().maximum(), 0)
+
+    def test_canvas_content_height_uses_unscaled_logical_dpi(self):
+        widget = self.make_widget()
+        widget.figure._original_dpi = 100.0
+        widget.figure._dpi = 200.0
+
+        widget._set_canvas_content_height(448)
+
+        self.assertEqual(widget.canvas.minimumHeight(), 448)
+        expected_height = max(448, widget.chart_scroll_area.viewport().height()) / 100.0
+        self.assertAlmostEqual(widget.figure.get_figheight(), expected_height)
+
+    def test_comparison_figure_fills_a_taller_viewport(self):
+        widget = self.make_widget()
+        widget.resize(1000, 700)
+        widget.show()
+        QTest.qWait(20)
+
+        viewport_height = widget.chart_scroll_area.viewport().height()
+        widget._set_canvas_content_height(448)
+
+        rendered_logical_height = (
+            widget.figure.get_figheight() * widget.figure._original_dpi
+        )
+        self.assertGreaterEqual(rendered_logical_height, viewport_height)
+
+    def test_filter_controls_wrap_only_on_narrow_width(self):
+        widget = self.make_widget()
+        widget.resize(640, 500)
+        widget.show()
+        QTest.qWait(20)
+
+        item_index = widget.controls_layout.indexOf(widget.stacked_widget)
+        self.assertEqual(widget.controls_layout.getItemPosition(item_index)[0], 1)
+        self.assertTrue(widget._controls_compact)
+
+        widget.resize(900, 500)
+        QTest.qWait(20)
+        item_index = widget.controls_layout.indexOf(widget.stacked_widget)
+        self.assertEqual(widget.controls_layout.getItemPosition(item_index)[0], 0)
+        self.assertFalse(widget._controls_compact)
+
+    def test_chart_type_change_draws_once_and_empty_state_draws_once(self):
+        database = FakeChartDatabase()
+        widget = self.make_widget(database)
+
+        with patch.object(widget.canvas, "draw_idle") as draw_idle:
+            widget.chart_type_combo.setCurrentIndex(1)
+        self.assertEqual(draw_idle.call_count, 1)
+
+        widget.chart_type_combo.setCurrentIndex(0)
+        database.trends[widget.name_combo.currentText()] = []
+        with patch.object(widget.canvas, "draw_idle") as draw_idle:
+            widget.generate_chart()
+        self.assertEqual(draw_idle.call_count, 1)
+        self.assertEqual(widget.last_chart_state, "empty")
 
     def test_display_settings_are_collapsible_and_persisted(self):
         first = self.make_widget()

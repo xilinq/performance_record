@@ -11,6 +11,8 @@ from PyQt5.QtWidgets import QApplication, QStyleFactory
 
 FONT_FALLBACKS = ("Microsoft YaHei UI", "Microsoft YaHei", "SimSun")
 DEFAULT_FONT_SIZE = 10
+CONTENT_MARGIN = 10
+CONTROL_SPACING = 8
 
 
 APP_STYLE_SHEET = """
@@ -44,6 +46,17 @@ QLabel[state="clean"] {
 
 QLabel[role="error"] {
     color: #b91c1c;
+    font-weight: 600;
+}
+
+QLabel[role="heading"] {
+    color: #172033;
+    font-size: 14pt;
+    font-weight: 600;
+}
+
+QLabel[role="sectionTitle"] {
+    color: #334155;
     font-weight: 600;
 }
 
@@ -124,6 +137,37 @@ QPushButton[role="secondary"]:hover {
     border-color: #94a3b8;
 }
 
+QToolButton {
+    min-width: 28px;
+    min-height: 28px;
+    padding: 2px 8px;
+    background-color: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    color: #334155;
+}
+
+QToolButton:hover {
+    background-color: #eef2f6;
+    border-color: #cbd5e1;
+}
+
+QToolButton:pressed, QToolButton:checked {
+    background-color: #dbeafe;
+    border-color: #93c5fd;
+    color: #1d4ed8;
+}
+
+QToolButton:focus {
+    border-color: #2563eb;
+}
+
+QToolButton:disabled {
+    color: #94a3b8;
+    background-color: transparent;
+    border-color: transparent;
+}
+
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit,
 QTimeEdit, QDateTimeEdit, QPlainTextEdit, QTextEdit {
     background-color: #ffffff;
@@ -158,12 +202,45 @@ QDateTimeEdit:disabled, QPlainTextEdit:disabled, QTextEdit:disabled {
     color: #94a3b8;
 }
 
+QLineEdit:read-only {
+    background-color: #f8fafc;
+    color: #475569;
+}
+
+QPlainTextEdit[state="warning"] {
+    background-color: #fffbeb;
+    border-color: #f2c66d;
+}
+
+QPlainTextEdit[state="clean"] {
+    background-color: #f7fcf8;
+    border-color: #bbdfc5;
+}
+
 QComboBox QAbstractItemView {
     background-color: #ffffff;
     border: 1px solid #cbd5e1;
     selection-background-color: #dbeafe;
     selection-color: #172033;
     outline: 0;
+}
+
+QTableView QComboBox, QTableWidget QComboBox {
+    min-height: 22px;
+    margin: 2px;
+    padding: 1px 22px 1px 6px;
+    background-color: transparent;
+    border-color: transparent;
+}
+
+QTableView QComboBox:hover, QTableWidget QComboBox:hover {
+    background-color: #ffffff;
+    border-color: #94a3b8;
+}
+
+QTableView QComboBox:focus, QTableWidget QComboBox:focus {
+    background-color: #ffffff;
+    border-color: #2563eb;
 }
 
 QTableView, QTableWidget {
@@ -188,6 +265,10 @@ QTableView::item:hover, QTableWidget::item:hover {
 QTableView::item:selected, QTableWidget::item:selected {
     background-color: #dbeafe;
     color: #172033;
+}
+
+QTableView:focus, QTableWidget:focus, QListView:focus, QTreeView:focus {
+    border-color: #2563eb;
 }
 
 QHeaderView::section {
@@ -233,6 +314,44 @@ QTabBar::tab:selected {
     background-color: #ffffff;
     color: #1d4ed8;
     font-weight: 600;
+}
+
+QTabWidget#mainNavigationTabs::pane {
+    background-color: #f3f6fa;
+    border: 0;
+    border-radius: 0;
+    top: -1px;
+}
+
+QTabBar#mainNavigationTabBar {
+    background-color: #f3f6fa;
+}
+
+QTabBar#mainNavigationTabBar::tab {
+    min-height: 34px;
+    padding: 7px 22px;
+    margin-right: 4px;
+    background-color: transparent;
+    border: 0;
+    border-bottom: 3px solid transparent;
+    border-radius: 0;
+    color: #475569;
+}
+
+QTabBar#mainNavigationTabBar::tab:hover {
+    background-color: #eef2f6;
+    color: #1f2937;
+}
+
+QTabBar#mainNavigationTabBar::tab:selected {
+    background-color: #ffffff;
+    border-bottom-color: #2563eb;
+    color: #1d4ed8;
+    font-weight: 600;
+}
+
+QTabWidget#dataManagementTabs::pane {
+    border-color: #dfe5ec;
 }
 
 QGroupBox {
@@ -287,6 +406,52 @@ QStatusBar {
 
 QSplitter::handle {
     background-color: #dfe5ec;
+}
+
+QAbstractScrollArea::corner {
+    background-color: #eef2f6;
+}
+
+QScrollBar:vertical {
+    width: 12px;
+    margin: 0;
+    background-color: #eef2f6;
+}
+
+QScrollBar::handle:vertical {
+    min-height: 24px;
+    margin: 2px;
+    background-color: #b8c4d2;
+    border-radius: 4px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background-color: #94a3b8;
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
+}
+
+QScrollBar:horizontal {
+    height: 12px;
+    margin: 0;
+    background-color: #eef2f6;
+}
+
+QScrollBar::handle:horizontal {
+    min-width: 24px;
+    margin: 2px;
+    background-color: #b8c4d2;
+    border-radius: 4px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background-color: #94a3b8;
+}
+
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0;
 }
 
 QToolTip {

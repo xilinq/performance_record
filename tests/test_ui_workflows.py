@@ -1,15 +1,25 @@
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QLocale, Qt
+from PyQt5.QtCore import QLocale, QSettings, Qt
 from PyQt5.QtGui import QKeySequence, QValidator
-from PyQt5.QtWidgets import QApplication, QDialog, QMessageBox
+from PyQt5.QtTest import QTest
+from PyQt5.QtWidgets import (
+    QApplication,
+    QDialog,
+    QDialogButtonBox,
+    QHeaderView,
+    QLineEdit,
+    QMessageBox,
+)
 
 from database import DatabaseManager
-from ui.data_entry_tab import DataEntryTab, NumericDelegate
+from ui.data_entry_tab import DataEntryTab, NumericDelegate, PeriodPickerDialog
 from ui.rename_person_dialog import RenamePersonDialog
 
 
@@ -34,7 +44,93 @@ class DataEntryWorkflowTests(unittest.TestCase):
         self.assertTrue(self.tab.has_unsaved_changes())
 
         item.setText("12.5")
-        self.assertEqual(item.toolTip(), "")
+        self.assertEqual(item.toolTip(), "12.5")
+
+    def test_numeric_validation_explains_distinct_error_classes(self):
+        item = self.tab.table.item(0, 3)
+        cases = {
+            "1,000": "不支持千分位分隔符",
+            "1.5": "订单只接受整数",
+            "nan": "不允许 NaN 或无穷大",
+            "9223372036854775808": "整数超出 SQLite 64 位范围",
+            "word": "请输入有效整数",
+        }
+        for value, message in cases.items():
+            with self.subTest(value=value):
+                item.setText(value)
+                self.assertIn(message, item.toolTip())
+
+    def test_numeric_delegate_paints_compact_text_but_model_keeps_repr(self):
+        original = 10.123456789012345
+        item = self.tab._numeric_item(original)
+        delegate = NumericDelegate(False, self.tab.table)
+
+        self.assertEqual(item.text(), repr(original))
+        self.assertEqual(item.toolTip(), repr(original))
+        self.assertEqual(delegate.displayText(item.text(), QLocale.c()), "10.123457")
+        self.assertIn("e", delegate.displayText("0.000000123456789", QLocale.c()))
+
+    def test_save_buttons_track_dirty_state(self):
+        self.assertFalse(self.tab.save_button.isEnabled())
+        self.assertFalse(self.tab.save_person_button.isEnabled())
+        self.assertFalse(self.tab.save_button.icon().isNull())
+        self.assertFalse(self.tab.refresh_button.icon().isNull())
+        self.assertFalse(self.tab.move_up_button.icon().isNull())
+        self.assertFalse(self.tab.del_row_button.icon().isNull())
+        self.tab.table.item(0, 2).setText("2")
+        self.assertTrue(self.tab.save_button.isEnabled())
+        self.tab.load_period_data()
+        self.assertFalse(self.tab.save_button.isEnabled())
+
+    def test_period_picker_uses_explicit_chinese_half_month_and_buttons(self):
+        dialog = PeriodPickerDialog(initial_period="2026-03-下")
+        try:
+            self.assertEqual(dialog.half_combo.currentText(), "下半月")
+            self.assertEqual(dialog.selected_period(), "2026-03-下")
+            buttons = dialog.findChild(QDialogButtonBox)
+            self.assertEqual(buttons.button(QDialogButtonBox.Ok).text(), "确定")
+            self.assertEqual(buttons.button(QDialogButtonBox.Cancel).text(), "取消")
+        finally:
+            dialog.close()
+
+    def test_compact_layout_columns_and_summary_preference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(
+                str(Path(directory) / "ui.ini"), QSettings.IniFormat
+            )
+            widget = DataEntryTab(self.db, settings=settings)
+            try:
+                widget.resize(820, 560)
+                widget.show()
+                QApplication.processEvents()
+                toolbar_index = widget.period_toolbar.indexOf(widget.add_row_button)
+                row, _column, _row_span, _column_span = (
+                    widget.period_toolbar.getItemPosition(toolbar_index)
+                )
+                self.assertEqual(row, 1)
+                self.assertTrue(widget.summary_text.isHidden())
+                self.assertGreaterEqual(widget.person_table.columnWidth(0), 120)
+                self.assertEqual(
+                    widget.table.horizontalHeader().sectionResizeMode(1),
+                    QHeaderView.Stretch,
+                )
+                self.assertEqual(
+                    widget.person_table.horizontalHeader().sectionResizeMode(1),
+                    QHeaderView.Stretch,
+                )
+                self.assertFalse(
+                    widget.table.horizontalHeader().stretchLastSection()
+                )
+
+                widget.summary_toggle.click()
+                self.assertFalse(widget.summary_text.isHidden())
+                self.assertTrue(
+                    settings.value(
+                        "ui/data_entry/summary_expanded", False, type=bool
+                    )
+                )
+            finally:
+                widget.close()
 
     def test_cancel_period_switch_restores_loaded_period(self):
         loaded_period = self.tab._loaded_period
@@ -66,6 +162,172 @@ class DataEntryWorkflowTests(unittest.TestCase):
         self.assertEqual(rows[0][0], "alice")
         self.assertEqual(rows[0][1], 18.5)
         self.assertFalse(self.tab.has_unsaved_changes())
+
+    def test_ctrl_s_commits_the_active_numeric_editor_before_saving(self):
+        period = self.tab.get_current_period()
+        self.db.save_period_data(
+            period,
+            [{"name": "alice", "left_perf": 1, "left_orders": 1}],
+        )
+        self.tab.load_period_data()
+        self.tab.show()
+        item = self.tab.table.item(0, 2)
+        self.tab.table.setCurrentCell(0, 2)
+        self.tab.table.editItem(item)
+        QApplication.processEvents()
+        editor = QApplication.focusWidget()
+        self.assertIsInstance(editor, QLineEdit)
+
+        QTest.keyClick(editor, Qt.Key_A, Qt.ControlModifier)
+        QTest.keyClicks(editor, "42.125")
+        QTest.keyClick(editor, Qt.Key_S, Qt.ControlModifier)
+        QApplication.processEvents()
+
+        self.assertEqual(self.db.get_data_by_period(period)[0][1], 42.125)
+        self.assertFalse(self.tab.has_unsaved_changes())
+
+    def test_f5_flushes_active_editor_before_dirty_resolution(self):
+        period = self.tab.get_current_period()
+        self.db.save_period_data(period, [{"name": "alice", "left_perf": 1}])
+        self.tab.load_period_data()
+        self.tab.show()
+        item = self.tab.table.item(0, 2)
+        self.tab.table.setCurrentCell(0, 2)
+        self.tab.table.editItem(item)
+        QApplication.processEvents()
+        editor = QApplication.focusWidget()
+        QTest.keyClick(editor, Qt.Key_A, Qt.ControlModifier)
+        QTest.keyClicks(editor, "63.5")
+
+        with patch.object(
+            self.tab, "_resolve_dirty", return_value=False
+        ) as resolve:
+            QTest.keyClick(editor, Qt.Key_F5)
+            QApplication.processEvents()
+
+        self.assertEqual(item.text(), "63.5")
+        self.assertTrue(self.tab._period_dirty)
+        resolve.assert_called_once_with("period")
+
+    def test_typed_person_text_cannot_redirect_loaded_rows_on_save(self):
+        period = self.tab.get_current_period()
+        self.db.save_period_data(
+            period,
+            [
+                {"name": "alice", "left_perf": 10},
+                {"name": "bob", "left_perf": 99},
+            ],
+        )
+        self.tab.tabs.setCurrentIndex(1)
+        self.tab.refresh_person_list("alice", preserve_current=False)
+        self.tab.load_person_data()
+        self.tab.person_table.item(0, 2).setText("25")
+        self.tab.person_combo.lineEdit().setText("bob")
+
+        with patch.object(QMessageBox, "warning") as warning:
+            self.assertFalse(self.tab.save_person_data())
+
+        self.assertEqual(self.tab._loaded_person, "alice")
+        self.assertEqual(self.tab.person_combo.currentData(Qt.UserRole), "alice")
+        self.assertEqual(self.db.get_all_data_by_name("alice")[0][1], 10)
+        self.assertEqual(self.db.get_all_data_by_name("bob")[0][1], 99)
+        self.assertIn("防止覆盖", warning.call_args.args[2])
+
+    def test_save_restores_period_row_identity_and_column(self):
+        period = self.tab.get_current_period()
+        self.db.add_name_to_all_names("bob")
+        self.db.save_period_data(
+            period,
+            [
+                {"name": "alice", "left_perf": 1},
+                {"name": "bob", "left_perf": 2},
+            ],
+        )
+        self.tab.load_period_data()
+        bob_row = next(
+            row
+            for row in range(self.tab.table.rowCount())
+            if self.tab._period_row_key(row) == "bob"
+        )
+        self.tab.table.setCurrentCell(bob_row, 4)
+        self.tab.summary_text.setPlainText("selection test")
+
+        self.assertTrue(self.tab.save_data())
+
+        self.assertEqual(self.tab._period_row_key(self.tab.table.currentRow()), "bob")
+        self.assertEqual(self.tab.table.currentColumn(), 4)
+
+    def test_row_shortcuts_do_not_run_from_text_inputs(self):
+        self.tab.show()
+        initial_rows = self.tab.table.rowCount()
+        original_text = "temporary text"
+        self.tab.new_person_input.setText(original_text)
+        self.tab.new_person_input.setCursorPosition(0)
+        self.tab.new_person_input.setFocus()
+        QApplication.processEvents()
+
+        QTest.keyClick(
+            self.tab.new_person_input, Qt.Key_Delete, Qt.ControlModifier
+        )
+        self.assertNotEqual(self.tab.new_person_input.text(), original_text)
+        QTest.keyClick(self.tab.new_person_input, Qt.Key_Insert)
+        QTest.keyClick(self.tab.new_person_input, Qt.Key_Up, Qt.AltModifier)
+        QTest.keyClick(self.tab.new_person_input, Qt.Key_Down, Qt.AltModifier)
+        QApplication.processEvents()
+
+        self.assertEqual(self.tab.table.rowCount(), initial_rows)
+
+        self.tab.table.setCurrentCell(0, 0)
+        self.tab.table.setFocus()
+        QApplication.processEvents()
+        QTest.keyClick(self.tab.table, Qt.Key_Insert)
+        QApplication.processEvents()
+        self.assertEqual(self.tab.table.rowCount(), initial_rows + 1)
+
+        self.tab.table.setFocus()
+        QApplication.processEvents()
+        QTest.keyClick(self.tab.table, Qt.Key_Delete, Qt.ControlModifier)
+        QApplication.processEvents()
+        self.assertEqual(self.tab.table.rowCount(), initial_rows)
+
+    def test_adding_person_cannot_discard_dirty_person_rows(self):
+        period = self.tab.get_current_period()
+        self.db.save_period_data(period, [{"name": "alice", "left_perf": 1}])
+        self.tab.tabs.setCurrentIndex(1)
+        self.tab.refresh_person_list("alice", preserve_current=False)
+        self.tab.load_person_data()
+        self.tab.person_table.item(0, 2).setText("77")
+
+        with patch.object(self.tab, "_resolve_dirty", return_value=False) as resolve:
+            self.assertFalse(self.tab._create_person("charlie"))
+
+        resolve.assert_called_once_with("person")
+        self.assertEqual(self.tab.person_table.item(0, 2).text(), "77")
+        self.assertTrue(self.tab._person_dirty)
+        self.assertNotIn("charlie", self.db.get_all_names())
+        self.assertEqual(self.db.get_all_data_by_name("alice")[0][1], 1)
+
+        def save_pending(kind):
+            self.assertEqual(kind, "person")
+            return self.tab.save_person_data()
+
+        with patch.object(self.tab, "_resolve_dirty", side_effect=save_pending):
+            self.assertTrue(self.tab._create_person("charlie"))
+
+        self.assertEqual(self.db.get_all_data_by_name("alice")[0][1], 77)
+        self.assertEqual(self.tab._loaded_person, "charlie")
+
+    def test_inactive_historical_person_uses_stable_raw_key(self):
+        period = self.tab.get_current_period()
+        self.db.save_period_data(period, [{"name": "alice", "left_perf": 1}])
+        self.db.deactivate_name("alice")
+
+        self.tab.refresh_person_list("alice", preserve_current=False)
+        index = self.tab.person_combo.findData("alice", Qt.UserRole)
+
+        self.assertGreaterEqual(index, 0)
+        self.assertEqual(self.tab.person_combo.itemText(index), "alice（停用）")
+        self.assertEqual(self.tab._combo_person_key(self.tab.person_combo, index), "alice")
 
     def test_person_period_cell_is_read_only(self):
         self.tab.refresh_person_list("alice")
@@ -147,7 +409,7 @@ class DataEntryWorkflowTests(unittest.TestCase):
 
         item = self.tab.table.item(0, 2)
         item.setText("1,234.5")
-        self.assertEqual(item.toolTip(), "请输入有效数字")
+        self.assertEqual(item.toolTip(), "不支持千分位分隔符，请直接输入数字")
         with self.assertRaises(ValueError):
             DataEntryTab._read_number(self.tab.table, 0, 2, float)
 
@@ -196,7 +458,7 @@ class DataEntryWorkflowTests(unittest.TestCase):
 
         item = self.tab.table.item(0, 3)
         item.setText("9223372036854775808")
-        self.assertEqual(item.toolTip(), "请输入有效数字")
+        self.assertEqual(item.toolTip(), "整数超出 SQLite 64 位范围")
         with self.assertRaises(ValueError):
             DataEntryTab._read_number(self.tab.table, 0, 3, int)
 
@@ -347,6 +609,38 @@ class DataEntryWorkflowTests(unittest.TestCase):
         self.assertEqual(dialog.result(), QDialog.Accepted)
         self.assertTrue(dialog.rename_succeeded)
         warning.assert_called_once()
+
+    def test_rename_dialog_validates_immediately_and_warns_before_merge(self):
+        self.db.add_name_to_all_names("bob")
+        dialog = RenamePersonDialog(db_manager=self.db, initial_name="alice")
+        ok_button = dialog.buttons.button(QDialogButtonBox.Ok)
+        self.assertFalse(ok_button.isEnabled())
+        dialog.new_name_input.setText("alice")
+        self.assertFalse(ok_button.isEnabled())
+        self.assertIn("不能与当前姓名相同", dialog.validation_label.text())
+        dialog.new_name_input.setText("bob")
+        self.assertTrue(ok_button.isEnabled())
+
+        with patch.object(
+            QMessageBox, "question", return_value=QMessageBox.No
+        ) as question:
+            dialog.confirm_rename()
+
+        self.assertIn("无冲突时期将合并", question.call_args.args[2])
+        self.assertIn("同期", question.call_args.args[2])
+        self.assertFalse(dialog.rename_succeeded)
+        dialog.close()
+
+    def test_rename_dialog_never_falls_back_to_unrelated_initial_person(self):
+        self.db.add_name_to_all_names("bob")
+        dialog = RenamePersonDialog(db_manager=self.db, initial_name="missing")
+        try:
+            self.assertEqual(dialog.old_name_combo.currentIndex(), -1)
+            self.assertFalse(
+                dialog.buttons.button(QDialogButtonBox.Ok).isEnabled()
+            )
+        finally:
+            dialog.close()
 
 
 if __name__ == "__main__":

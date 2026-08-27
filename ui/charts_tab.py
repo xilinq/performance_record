@@ -8,13 +8,15 @@ import logging
 import matplotlib
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PyQt5.QtCore import QSettings, QSignalBlocker, Qt
+from PyQt5.QtCore import QSettings, QSignalBlocker, Qt, QTimer
 from PyQt5.QtWidgets import (
     QComboBox,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
+    QScrollArea,
     QSizePolicy,
     QStackedWidget,
     QToolButton,
@@ -38,11 +40,14 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 class ChartsTab(QWidget):
     """按人员趋势或时期展示业绩数据。"""
 
-    FONT_SIZES = (
-        "6", "7", "8", "9", "10", "11", "12", "14", "16", "18", "20", "22", "24"
-    )
+    FONT_SIZES = ("8", "9", "10", "11", "12", "14", "16", "18", "20", "22", "24")
     MAX_TREND_TICKS = 10
     MAX_FULL_TREND_LABELS = 8
+    BASE_CANVAS_HEIGHT = 180
+    COMPARISON_ROW_HEIGHT = 32
+    COMPARISON_VERTICAL_PADDING = 128
+    COMPACT_CONTROLS_WIDTH = 760
+    FONT_REDRAW_DELAY_MS = 150
 
     def __init__(self, db_manager, settings=None):
         super().__init__()
@@ -52,11 +57,17 @@ class ChartsTab(QWidget):
         self.last_chart_state = "empty"
         self.last_error = ""
         self._initializing = True
+        self._controls_compact = None
+
+        self._font_redraw_timer = QTimer(self)
+        self._font_redraw_timer.setSingleShot(True)
+        self._font_redraw_timer.setInterval(self.FONT_REDRAW_DELAY_MS)
+        self._font_redraw_timer.timeout.connect(self.generate_chart)
 
         self.figure = Figure(dpi=100, facecolor="#ffffff", constrained_layout=True)
         self.canvas = FigureCanvas(self.figure)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.canvas.setMinimumHeight(280)
+        self.canvas.setMinimumHeight(self.BASE_CANVAS_HEIGHT)
 
         self.init_ui()
         self._initializing = False
@@ -67,19 +78,21 @@ class ChartsTab(QWidget):
         main_layout.setContentsMargins(12, 12, 12, 12)
         main_layout.setSpacing(8)
 
-        controls_layout = QHBoxLayout()
-        controls_layout.setSpacing(8)
-        controls_layout.addWidget(QLabel("图表类型："))
+        self.controls_widget = QWidget()
+        self.controls_layout = QGridLayout(self.controls_widget)
+        self.controls_layout.setContentsMargins(0, 0, 0, 0)
+        self.controls_layout.setHorizontalSpacing(8)
+        self.controls_layout.setVerticalSpacing(6)
+        self.chart_type_label = QLabel("图表类型：")
 
         self.chart_type_combo = QComboBox()
         self.chart_type_combo.setObjectName("chartTypeCombo")
         self.chart_type_combo.addItems(["个人业绩趋势（折线图）", "时期业绩对比（横向柱状图）"])
         self.chart_type_combo.setMinimumWidth(210)
         self.chart_type_combo.setMaximumWidth(280)
-        controls_layout.addWidget(self.chart_type_combo)
 
         self.stacked_widget = QStackedWidget()
-        self.stacked_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.stacked_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         self.name_filter_widget = QWidget()
         name_layout = QHBoxLayout(self.name_filter_widget)
@@ -102,15 +115,12 @@ class ChartsTab(QWidget):
         self.period_combo.setMaximumWidth(220)
         period_layout.addWidget(self.period_combo)
         self.stacked_widget.addWidget(self.period_filter_widget)
-        controls_layout.addWidget(self.stacked_widget)
-        controls_layout.addStretch(1)
-
         self.display_settings_button = QToolButton()
         self.display_settings_button.setText("显示设置")
         self.display_settings_button.setCheckable(True)
         self.display_settings_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        controls_layout.addWidget(self.display_settings_button)
-        main_layout.addLayout(controls_layout)
+        self._layout_controls(self.width() < self.COMPACT_CONTROLS_WIDTH)
+        main_layout.addWidget(self.controls_widget)
 
         self.display_settings_panel = QFrame()
         self.display_settings_panel.setObjectName("displaySettingsPanel")
@@ -133,7 +143,15 @@ class ChartsTab(QWidget):
         settings_layout.addRow("坐标轴字体：", self.xlabel_font_size_combo)
         main_layout.addWidget(self.display_settings_panel)
 
-        main_layout.addWidget(self.canvas, 1)
+        self.chart_scroll_area = QScrollArea()
+        self.chart_scroll_area.setObjectName("chartScrollArea")
+        self.chart_scroll_area.setFrameShape(QFrame.NoFrame)
+        self.chart_scroll_area.setWidgetResizable(True)
+        self.chart_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.chart_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.chart_scroll_area.setMinimumHeight(self.BASE_CANVAS_HEIGHT)
+        self.chart_scroll_area.setWidget(self.canvas)
+        main_layout.addWidget(self.chart_scroll_area, 1)
 
         self._restore_settings()
         self.stacked_widget.setCurrentIndex(self.chart_type_combo.currentIndex())
@@ -200,7 +218,52 @@ class ChartsTab(QWidget):
             return
         self.settings.setValue("charts/data_font_size", self.data_font_size_combo.currentText())
         self.settings.setValue("charts/axis_font_size", self.xlabel_font_size_combo.currentText())
-        self.generate_chart()
+        self._font_redraw_timer.start()
+
+    def _layout_controls(self, compact):
+        """在窄窗口中将对象筛选移到第二行，避免控件被挤压或裁切。"""
+        compact = bool(compact)
+        if self._controls_compact == compact:
+            return
+
+        while self.controls_layout.count():
+            self.controls_layout.takeAt(0)
+        for column in range(5):
+            self.controls_layout.setColumnStretch(column, 0)
+
+        if compact:
+            self.controls_layout.addWidget(self.chart_type_label, 0, 0)
+            self.controls_layout.addWidget(self.chart_type_combo, 0, 1)
+            self.controls_layout.setColumnStretch(2, 1)
+            self.controls_layout.addWidget(self.display_settings_button, 0, 3)
+            self.controls_layout.addWidget(self.stacked_widget, 1, 0, 1, 4)
+        else:
+            self.controls_layout.addWidget(self.chart_type_label, 0, 0)
+            self.controls_layout.addWidget(self.chart_type_combo, 0, 1)
+            self.controls_layout.addWidget(self.stacked_widget, 0, 2)
+            self.controls_layout.setColumnStretch(3, 1)
+            self.controls_layout.addWidget(self.display_settings_button, 0, 4)
+
+        self._controls_compact = compact
+        self.controls_layout.invalidate()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "controls_layout"):
+            self._layout_controls(event.size().width() < self.COMPACT_CONTROLS_WIDTH)
+
+    def _set_canvas_content_height(self, height):
+        """调整滚动画布内容高度；比较图较长时只滚动图表区域。"""
+        height = max(self.BASE_CANVAS_HEIGHT, int(height))
+        self.canvas.setMinimumHeight(height)
+        # Qt 高 DPI 下 FigureCanvas 会把 figure.dpi 乘以设备缩放比；这里的
+        # height 是 Qt 逻辑像素，必须用 Matplotlib 保存的原始 DPI 换算。
+        # 否则在 200% 缩放时图形只占一半高度，并在画布下方留下大片空白。
+        logical_dpi = float(getattr(self.figure, "_original_dpi", self.figure.dpi))
+        viewport_height = self.chart_scroll_area.viewport().height()
+        render_height = max(height, viewport_height)
+        self.figure.set_figheight(render_height / logical_dpi)
+        self.canvas.updateGeometry()
 
     @staticmethod
     def _replace_combo_items(combo, items, preferred_text):
@@ -247,6 +310,8 @@ class ChartsTab(QWidget):
 
     def generate_chart(self):
         """根据当前选择生成图表；异常会在画布内明确展示。"""
+        if self._font_redraw_timer.isActive():
+            self._font_redraw_timer.stop()
         try:
             self.figure.clear()
             if self.chart_type_combo.currentIndex() == 0:
@@ -257,9 +322,11 @@ class ChartsTab(QWidget):
         except Exception as exc:
             LOGGER.exception("生成图表失败")
             self.last_error = str(exc)
-            self._render_status("图表加载失败", self.last_error, is_error=True)
+            self._render_status("图表加载失败", self.last_error, is_error=True, draw=False)
+            self.canvas.draw_idle()
 
-    def _render_status(self, title, detail="", is_error=False):
+    def _render_status(self, title, detail="", is_error=False, draw=True):
+        self._set_canvas_content_height(self.BASE_CANVAS_HEIGHT)
         self.figure.clear()
         ax = self.figure.add_subplot(111)
         ax.set_axis_off()
@@ -293,7 +360,8 @@ class ChartsTab(QWidget):
         self.last_chart_state = "error" if is_error else "empty"
         if not is_error:
             self.last_error = ""
-        self.canvas.draw_idle()
+        if draw:
+            self.canvas.draw_idle()
 
     @staticmethod
     def _sample_indices(count, maximum):
@@ -306,14 +374,15 @@ class ChartsTab(QWidget):
         return list(dict.fromkeys(indices))
 
     def plot_person_trend(self):
+        self._set_canvas_content_height(self.BASE_CANVAS_HEIGHT)
         name = self.name_combo.currentText()
         if not name:
-            self._render_status("暂无可展示的人员数据", "请先在数据录入页添加业绩记录。")
+            self._render_status("暂无可展示的人员数据", "请先在数据录入页添加业绩记录。", draw=False)
             return
 
         data = self.db.get_data_by_name(name)
         if not data:
-            self._render_status("暂无业绩数据", "未找到 {} 的业绩记录。".format(name))
+            self._render_status("暂无业绩数据", "未找到 {} 的业绩记录。".format(name), draw=False)
             return
 
         ax = self.figure.add_subplot(111)
@@ -329,29 +398,37 @@ class ChartsTab(QWidget):
             ax.plot(
                 x_positions,
                 left_perfs,
-                color="#2563eb",
+                color="#0072b2",
                 marker="o",
+                markerfacecolor="white",
+                markeredgewidth=1.2,
                 markersize=4,
                 linewidth=1.7,
+                linestyle="-",
                 label="左区业绩",
             )[0],
             ax.plot(
                 x_positions,
                 right_perfs,
-                color="#0f766e",
-                marker="o",
+                color="#d55e00",
+                marker="^",
+                markerfacecolor="white",
+                markeredgewidth=1.2,
                 markersize=4,
                 linewidth=1.7,
+                linestyle="--",
                 label="右区业绩",
             )[0],
             ax.plot(
                 x_positions,
                 total_perfs,
-                color="#d97706",
+                color="#009e73",
                 marker="s",
+                markerfacecolor="white",
+                markeredgewidth=1.2,
                 markersize=4,
                 linewidth=2.0,
-                linestyle="--",
+                linestyle="-.",
                 label="总业绩",
             )[0],
         ]
@@ -395,9 +472,18 @@ class ChartsTab(QWidget):
         ax.set_ylabel("业绩")
         ax.tick_params(axis="x", labelsize=axis_font_size)
         ax.tick_params(axis="y", labelsize=axis_font_size)
-        ax.legend(fontsize=data_font_size, frameon=False, ncol=3, loc="best")
+        ax.legend(
+            handles=lines,
+            labels=["左区业绩", "右区业绩", "总业绩"],
+            fontsize=data_font_size,
+            frameon=False,
+            ncol=3,
+            loc="upper left",
+        )
         ax.grid(axis="y", linestyle="--", linewidth=0.7, alpha=0.35)
         ax.margins(x=0.03, y=0.16)
+        if min(left_perfs + right_perfs + total_perfs) >= 0:
+            ax.set_ylim(bottom=0)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
         self.last_chart_state = "ready"
@@ -406,13 +492,13 @@ class ChartsTab(QWidget):
     def plot_period_comparison(self):
         period = self.period_combo.currentText()
         if not period:
-            self._render_status("暂无可展示的时期数据", "请先在数据录入页添加业绩记录。")
+            self._render_status("暂无可展示的时期数据", "请先在数据录入页添加业绩记录。", draw=False)
             return
 
         # DatabaseManager 接受中英文时期格式，无需自行替换字符串。
         data = self.db.get_data_by_period(period)
         if not data:
-            self._render_status("暂无业绩数据", "未找到 {} 的业绩记录。".format(period))
+            self._render_status("暂无业绩数据", "未找到 {} 的业绩记录。".format(period), draw=False)
             return
 
         ax = self.figure.add_subplot(111)
@@ -420,44 +506,61 @@ class ChartsTab(QWidget):
         left_perfs = [float(row[1] or 0) for row in data]
         right_perfs = [float(row[2] or 0) for row in data]
         y_positions = list(range(len(names)))
+        self._set_canvas_content_height(
+            self.COMPARISON_VERTICAL_PADDING + len(names) * self.COMPARISON_ROW_HEIGHT
+        )
         bar_height = 0.36
         data_font_size = int(self.data_font_size_combo.currentText())
         axis_font_size = int(self.xlabel_font_size_combo.currentText())
-        name_font_size = max(7, min(axis_font_size, 11 if len(names) <= 12 else 9))
+        name_font_size = max(8, min(axis_font_size, 11 if len(names) <= 12 else 9))
 
         left_bars = ax.barh(
             [position + bar_height / 2 for position in y_positions],
             left_perfs,
             bar_height,
-            color="#2563eb",
+            color="#0072b2",
+            edgecolor="#1f2937",
+            linewidth=0.8,
+            hatch="///",
             label="左区业绩",
         )
         right_bars = ax.barh(
             [position - bar_height / 2 for position in y_positions],
             right_perfs,
             bar_height,
-            color="#0f766e",
+            color="#e69f00",
+            edgecolor="#1f2937",
+            linewidth=0.8,
+            hatch="...",
             label="右区业绩",
         )
 
-        ax.set_title("{} 业绩对比".format(period), pad=12)
+        # 标题与图例共享坐标轴上方的独立信息带，避免图例覆盖最后一行柱体。
+        ax.set_title("{} 业绩对比".format(period), loc="left", pad=16)
         ax.set_xlabel("业绩")
         ax.set_yticks(y_positions)
         ax.set_yticklabels(names)
         ax.invert_yaxis()
         ax.tick_params(axis="x", labelsize=axis_font_size)
         ax.tick_params(axis="y", labelsize=name_font_size)
-        ax.legend(fontsize=data_font_size, frameon=False, ncol=2, loc="best")
+        ax.legend(
+            handles=[left_bars, right_bars],
+            labels=["左区业绩", "右区业绩"],
+            fontsize=data_font_size,
+            frameon=False,
+            ncol=2,
+            loc="lower right",
+            bbox_to_anchor=(1.0, 1.01),
+            borderaxespad=0,
+        )
         ax.grid(axis="x", linestyle="--", linewidth=0.7, alpha=0.35)
         ax.margins(x=0.14, y=0.03)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
 
-        # 人数较多时省略柱端数字，优先保证姓名与柱体清晰可读。
-        if len(names) <= 15:
-            label_size = min(data_font_size, 10)
-            ax.bar_label(left_bars, padding=3, fmt="%.1f", fontsize=label_size)
-            ax.bar_label(right_bars, padding=3, fmt="%.1f", fontsize=label_size)
+        label_size = max(8, min(data_font_size, 10))
+        ax.bar_label(left_bars, padding=3, fmt="%.1f", fontsize=label_size)
+        ax.bar_label(right_bars, padding=3, fmt="%.1f", fontsize=label_size)
 
         self.last_chart_state = "ready"
         self.last_error = ""

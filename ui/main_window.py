@@ -2,16 +2,26 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from PyQt5.QtCore import QSettings, QSignalBlocker
-from PyQt5.QtGui import QKeySequence
-from PyQt5.QtWidgets import QAction, QFileDialog, QMainWindow, QMessageBox, QTabWidget
+from PyQt5.QtCore import QRect, QSettings, QSignalBlocker
+from PyQt5.QtGui import QGuiApplication, QKeySequence
+from PyQt5.QtWidgets import (
+    QAction,
+    QDialog,
+    QFileDialog,
+    QMainWindow,
+    QMessageBox,
+    QStyle,
+    QTabWidget,
+)
 
 try:
     from .charts_tab import ChartsTab
     from .data_entry_tab import DataEntryTab
+    from .import_preview_dialog import ImportPreviewDialog
 except ImportError:  # 支持直接运行本文件
     from charts_tab import ChartsTab
     from data_entry_tab import DataEntryTab
+    from import_preview_dialog import ImportPreviewDialog
 
 
 class MainWindow(QMainWindow):
@@ -28,14 +38,15 @@ class MainWindow(QMainWindow):
         self._active_tab_index = 0
 
         self.setWindowTitle("业绩追踪系统[*]")
-        self.resize(1200, 800)
-        self.setMinimumSize(960, 640)
+        self.setMinimumSize(680, 480)
+        self._set_initial_window_geometry()
         self.create_menu_bar()
 
         self.tabs = QTabWidget()
         self.tabs.setObjectName("mainNavigationTabs")
+        self.tabs.tabBar().setObjectName("mainNavigationTabBar")
         self.setCentralWidget(self.tabs)
-        self.data_entry_tab = DataEntryTab(self.db)
+        self.data_entry_tab = DataEntryTab(self.db, settings=self.settings)
         self.charts_tab = ChartsTab(self.db, settings=self.settings)
         self.tabs.addTab(self.data_entry_tab, "数据管理")
         self.tabs.addTab(self.charts_tab, "统计图表")
@@ -47,6 +58,63 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("就绪", 3000)
 
     @staticmethod
+    def _intersection_area(first, second):
+        intersection = first.intersected(second)
+        return max(0, intersection.width()) * max(0, intersection.height())
+
+    def _available_geometry(self, target_rect=None):
+        """Return the best screen's available geometry for a window rectangle."""
+        screens = list(QGuiApplication.screens())
+        primary = QGuiApplication.primaryScreen()
+        if not screens and primary is None:
+            return QRect(0, 0, 1200, 800)
+
+        target_rect = QRect(target_rect or self.geometry())
+        if not target_rect.isValid() or target_rect.isEmpty():
+            screen = primary or screens[0]
+            return QRect(screen.availableGeometry())
+
+        screen = QGuiApplication.screenAt(target_rect.center())
+        if screen is None and screens:
+            screen = max(
+                screens,
+                key=lambda candidate: self._intersection_area(
+                    target_rect, candidate.availableGeometry()
+                ),
+            )
+            if self._intersection_area(target_rect, screen.availableGeometry()) == 0:
+                screen = primary or screens[0]
+        screen = screen or primary or screens[0]
+        return QRect(screen.availableGeometry())
+
+    def _set_initial_window_geometry(self):
+        """Size a fresh window to 90% of the primary work area, within limits."""
+        available = self._available_geometry()
+        width = max(self.minimumWidth(), min(1200, round(available.width() * 0.9)))
+        height = max(self.minimumHeight(), min(800, round(available.height() * 0.9)))
+        self.resize(width, height)
+        self.move(
+            available.left() + max(0, (available.width() - width) // 2),
+            available.top() + max(0, (available.height() - height) // 2),
+        )
+
+    def _clamp_window_to_available_screen(self):
+        """Keep restored geometry visible after monitor or scale-factor changes."""
+        current = QRect(self.geometry())
+        available = self._available_geometry(current)
+        width = max(
+            self.minimumWidth(), min(current.width(), available.width())
+        )
+        height = max(
+            self.minimumHeight(), min(current.height(), available.height())
+        )
+        max_x = available.right() - width + 1
+        max_y = available.bottom() - height + 1
+        x = max(available.left(), min(current.left(), max_x))
+        y = max(available.top(), min(current.top(), max_y))
+        self.setGeometry(x, y, width, height)
+
+    @staticmethod
     def _set_action_shortcut(action, shortcut):
         action.setShortcut(QKeySequence(shortcut))
         action.setShortcutVisibleInContextMenu(True)
@@ -55,23 +123,29 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("文件")
 
         self.export_action = QAction("导出 CSV…", self)
+        self.export_action.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
         self._set_action_shortcut(self.export_action, "Ctrl+Shift+E")
         self.export_action.triggered.connect(self.export_csv)
         file_menu.addAction(self.export_action)
 
         self.import_action = QAction("导入 CSV…", self)
+        self.import_action.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
         self._set_action_shortcut(self.import_action, "Ctrl+I")
         self.import_action.triggered.connect(self.import_csv)
         file_menu.addAction(self.import_action)
         file_menu.addSeparator()
 
         self.backup_action = QAction("立即备份", self)
+        self.backup_action.setIcon(self.style().standardIcon(QStyle.SP_DriveHDIcon))
         self._set_action_shortcut(self.backup_action, "Ctrl+B")
         self.backup_action.triggered.connect(self.manual_backup)
         file_menu.addAction(self.backup_action)
 
         tools_menu = self.menuBar().addMenu("工具")
         self.recalculate_action = QAction("重新计算所有增长率", self)
+        self.recalculate_action.setIcon(
+            self.style().standardIcon(QStyle.SP_BrowserReload)
+        )
         self.recalculate_action.triggered.connect(self.recalculate_growth_rates)
         tools_menu.addAction(self.recalculate_action)
 
@@ -84,6 +158,7 @@ class MainWindow(QMainWindow):
         geometry = self.settings.value("ui/window_geometry")
         if geometry:
             self.restoreGeometry(geometry)
+            self._clamp_window_to_available_screen()
         try:
             data_tab_index = int(self.settings.value("ui/data_tab", 0))
         except (TypeError, ValueError):
@@ -98,8 +173,6 @@ class MainWindow(QMainWindow):
             main_tab_index = 0
         self._active_tab_index = main_tab_index if main_tab_index in (0, 1) else 0
         self.tabs.setCurrentIndex(self._active_tab_index)
-        if self._active_tab_index == 1:
-            self.charts_tab.populate_filters()
 
     def _save_window_state(self):
         self.settings.setValue("ui/window_geometry", self.saveGeometry())
@@ -112,10 +185,6 @@ class MainWindow(QMainWindow):
 
     def on_dirty_changed(self, dirty):
         self.setWindowModified(bool(dirty))
-        if dirty:
-            self.statusBar().showMessage("存在未保存更改")
-        elif self.statusBar().currentMessage() == "存在未保存更改":
-            self.statusBar().showMessage("更改已保存", 3000)
 
     def on_tab_changed(self, index):
         if index == self._active_tab_index:
@@ -245,23 +314,8 @@ class MainWindow(QMainWindow):
         if not self.data_entry_tab.resolve_pending_changes():
             return False
 
-        message = (
-            "导入后将替换当前全部业务数据。\n\n"
-            f"业绩记录：{plan.get('performance_count', 0)} 条\n"
-            f"时期总结：{plan.get('summary_count', 0)} 条\n"
-            f"姓名名册：{plan.get('name_count', 0)} 人"
-        )
-        warnings = plan.get("warnings") or []
-        if warnings:
-            message += "\n\n预检提示：\n" + "\n".join(f"- {item}" for item in warnings)
-        reply = QMessageBox.question(
-            self,
-            "确认覆盖导入",
-            message,
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
+        preview_dialog = ImportPreviewDialog(plan, parent=self)
+        if preview_dialog.exec_() != QDialog.Accepted:
             return False
 
         try:

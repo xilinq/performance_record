@@ -8,8 +8,8 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QSettings
-from PyQt5.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PyQt5.QtCore import QRect, QSettings
+from PyQt5.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
 
 from database import DatabaseManager
 from ui.main_window import MainWindow
@@ -52,18 +52,57 @@ class MainWindowWorkflowTests(unittest.TestCase):
         window.data_entry_tab.load_period_data()
         window.close()
 
-    def test_window_and_tab_state_are_restored_with_win7_safe_minimum(self):
+    def test_window_and_tab_state_are_restored_with_compact_minimum(self):
         self.settings.setValue("ui/main_tab", 1)
         self.settings.setValue("ui/data_tab", 1)
         window = MainWindow(self.db, settings=self.settings)
 
         self.assertEqual(window.tabs.currentIndex(), 1)
         self.assertEqual(window.data_entry_tab.tabs.currentIndex(), 1)
-        self.assertEqual(window.minimumWidth(), 960)
-        self.assertEqual(window.minimumHeight(), 640)
+        self.assertEqual(window.minimumWidth(), 680)
+        self.assertEqual(window.minimumHeight(), 480)
+        self.assertLessEqual(window.width(), 1200)
+        self.assertLessEqual(window.height(), 800)
+        self.assertIs(window.data_entry_tab.settings, self.settings)
 
         window.close()
         self.assertTrue(self.settings.contains("ui/window_geometry"))
+
+    def test_restored_geometry_is_clamped_to_the_available_screen(self):
+        window = self._create_window()
+        window.setGeometry(5000, 4000, 1100, 760)
+        available = QRect(0, 0, 1024, 768)
+
+        with patch.object(window, "_available_geometry", return_value=available):
+            window._clamp_window_to_available_screen()
+
+        self.assertTrue(available.contains(window.geometry()))
+        self.assertEqual(window.geometry().size().width(), 1024)
+        self.assertEqual(window.geometry().size().height(), 760)
+
+    def test_dirty_signal_only_updates_window_modified_marker(self):
+        window = self._create_window()
+        window.statusBar().showMessage("正在执行其他操作")
+
+        window.on_dirty_changed(True)
+        self.assertTrue(window.isWindowModified())
+        self.assertEqual(window.statusBar().currentMessage(), "正在执行其他操作")
+
+        window.on_dirty_changed(False)
+        self.assertFalse(window.isWindowModified())
+        self.assertEqual(window.statusBar().currentMessage(), "正在执行其他操作")
+
+    def test_restoring_chart_page_does_not_refresh_filters_twice(self):
+        self.settings.setValue("ui/main_tab", 1)
+        with patch.object(
+            self.db,
+            "get_distinct_names",
+            wraps=self.db.get_distinct_names,
+        ) as names_query:
+            window = self._create_window()
+
+        self.assertEqual(window.tabs.currentIndex(), 1)
+        self.assertEqual(names_query.call_count, 1)
 
     def test_export_and_manual_backup_stop_when_pending_changes_are_cancelled(self):
         window = self._create_window()
@@ -106,11 +145,12 @@ class MainWindowWorkflowTests(unittest.TestCase):
             window.data_entry_tab,
             "resolve_pending_changes",
             side_effect=lambda: events.append("dirty") or True,
-        ), patch.object(
-            QMessageBox,
-            "question",
-            side_effect=lambda *_args, **_kwargs: events.append("confirm")
-            or QMessageBox.Yes,
+        ), patch(
+            "ui.main_window.ImportPreviewDialog"
+        ) as dialog_class, patch.object(
+            dialog_class.return_value,
+            "exec_",
+            side_effect=lambda: events.append("confirm") or QDialog.Accepted,
         ), patch.object(
             self.db,
             "apply_import_plan",

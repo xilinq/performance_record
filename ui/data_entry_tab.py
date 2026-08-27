@@ -1,7 +1,7 @@
 import math
 import sys
 
-from PyQt5.QtCore import QDate, QLocale, QSignalBlocker, Qt, pyqtSignal
+from PyQt5.QtCore import QDate, QLocale, QSettings, QSignalBlocker, Qt, pyqtSignal
 from PyQt5.QtGui import (
     QColor,
     QDoubleValidator,
@@ -10,6 +10,7 @@ from PyQt5.QtGui import (
 )
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -17,17 +18,21 @@ from PyQt5.QtWidgets import (
     QFrame,
     QHeaderView,
     QHBoxLayout,
+    QGridLayout,
     QLabel,
     QLineEdit,
+    QInputDialog,
     QMessageBox,
     QPushButton,
     QShortcut,
     QSpinBox,
+    QStyle,
     QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -128,13 +133,45 @@ def _mutation_error(result, attribute, fallback=""):
 class NumericDelegate(QStyledItemDelegate):
     """为业绩和订单列提供兼容 Qt5 的数值编辑器。"""
 
-    def __init__(self, integer=False, parent=None):
+    def __init__(self, integer=False, parent=None, dirty_callback=None):
         super().__init__(parent)
         self.integer = integer
+        self.dirty_callback = dirty_callback
 
     def createEditor(self, parent, option, index):
         editor = QLineEdit(parent)
         editor.setValidator(_numeric_validator(self.integer, editor))
+        if self.dirty_callback:
+            editor.textEdited.connect(self.dirty_callback)
+        return editor
+
+    def displayText(self, value, locale):
+        """Keep full precision in the model while painting a compact value."""
+
+        text = str(value or "").strip()
+        if not text or self.integer:
+            return text
+        try:
+            numeric = _parse_numeric_text(text, integer=False)
+        except ValueError:
+            return text
+        magnitude = abs(numeric)
+        if magnitude and (magnitude >= 1_000_000_000 or magnitude < 0.0001):
+            return format(numeric, ".6g")
+        return f"{numeric:.6f}".rstrip("0").rstrip(".") or "0"
+
+
+class DirtyTrackingDelegate(QStyledItemDelegate):
+    """Notify the page as soon as text is typed, before Qt commits the editor."""
+
+    def __init__(self, parent=None, dirty_callback=None):
+        super().__init__(parent)
+        self.dirty_callback = dirty_callback
+
+    def createEditor(self, parent, option, index):
+        editor = super().createEditor(parent, option, index)
+        if self.dirty_callback and isinstance(editor, QLineEdit):
+            editor.textEdited.connect(self.dirty_callback)
         return editor
 
 
@@ -145,6 +182,7 @@ class PeriodPickerDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("选择时期")
         self.setModal(True)
+        self.setMinimumWidth(360)
 
         today = QDate.currentDate()
         year = today.year()
@@ -167,13 +205,16 @@ class PeriodPickerDialog(QDialog):
         self.month_combo.addItems([f"{value:02d}月" for value in range(1, 13)])
         self.month_combo.setCurrentIndex(max(0, min(11, month - 1)))
         self.half_combo = QComboBox()
-        self.half_combo.addItems(["上", "下"])
-        self.half_combo.setCurrentText(half if half in ("上", "下") else "上")
+        self.half_combo.addItem("上半月", "上")
+        self.half_combo.addItem("下半月", "下")
+        self.half_combo.setCurrentIndex(0 if half == "上" else 1)
 
         form.addRow("年份", self.year_spin)
         form.addRow("月份", self.month_combo)
         form.addRow("半月", self.half_combo)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("确定")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
@@ -182,7 +223,7 @@ class PeriodPickerDialog(QDialog):
         return (
             f"{self.year_spin.value()}-"
             f"{self.month_combo.currentIndex() + 1:02d}-"
-            f"{self.half_combo.currentText()}"
+            f"{self.half_combo.currentData()}"
         )
 
 
@@ -201,9 +242,14 @@ class DataEntryTab(QWidget):
         "左区增长%", "右区增长%", "总增长%",
     ]
 
-    def __init__(self, db_manager):
+    def __init__(self, db_manager, settings=None):
         super().__init__()
         self.db = db_manager
+        self.settings = (
+            settings
+            if settings is not None
+            else QSettings("PerformanceRecord", "PerformanceRecord")
+        )
         self._loading = False
         self._validation_guard = False
         self._period_dirty = False
@@ -215,6 +261,10 @@ class DataEntryTab(QWidget):
         self._period_view_stale = False
         self._person_view_stale = False
         self._shortcuts = []
+        self._compact_mode = None
+        self._summary_auto_mode = not self.settings.contains(
+            "ui/data_entry/summary_expanded"
+        )
         self.init_ui()
 
     @staticmethod
@@ -237,8 +287,17 @@ class DataEntryTab(QWidget):
         self.init_person_tab()
         self.tabs.currentChanged.connect(self.on_internal_tab_changed)
         self._install_shortcuts()
+        self._update_dirty_state()
 
-    def _configure_table(self, table, headers):
+    def _configure_table(
+        self,
+        table,
+        headers,
+        stretch_column,
+        settings_key,
+        dirty_callback,
+        default_widths,
+    ):
         table.setColumnCount(len(headers))
         table.setHorizontalHeaderLabels(headers)
         table.setAlternatingRowColors(True)
@@ -254,16 +313,112 @@ class DataEntryTab(QWidget):
         header = table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
         header.setMinimumSectionSize(70)
-        header.setStretchLastSection(True)
-        for column, width in enumerate((92, 120, 100, 88, 100, 88, 96, 96, 96)):
+        header.setStretchLastSection(False)
+        for column, width in enumerate(default_widths):
             table.setColumnWidth(column, width)
-        table.setItemDelegateForColumn(2, NumericDelegate(False, table))
-        table.setItemDelegateForColumn(3, NumericDelegate(True, table))
-        table.setItemDelegateForColumn(4, NumericDelegate(False, table))
-        table.setItemDelegateForColumn(5, NumericDelegate(True, table))
+        self._restore_column_widths(table, settings_key, stretch_column)
+        header.setSectionResizeMode(stretch_column, QHeaderView.Stretch)
+        text_column = 0 if table is self.table else 1
+        table.setItemDelegateForColumn(
+            text_column, DirtyTrackingDelegate(table, dirty_callback)
+        )
+        table.setItemDelegateForColumn(
+            2, NumericDelegate(False, table, dirty_callback)
+        )
+        table.setItemDelegateForColumn(
+            3, NumericDelegate(True, table, dirty_callback)
+        )
+        table.setItemDelegateForColumn(
+            4, NumericDelegate(False, table, dirty_callback)
+        )
+        table.setItemDelegateForColumn(
+            5, NumericDelegate(True, table, dirty_callback)
+        )
+        header.sectionResized.connect(
+            lambda *_args, target=table, key=settings_key, stretch=stretch_column:
+            self._save_column_widths(target, key, stretch)
+        )
+
+    def _restore_column_widths(self, table, settings_key, stretch_column):
+        stored = self.settings.value(settings_key, [])
+        if not isinstance(stored, (list, tuple)) or len(stored) != table.columnCount():
+            return
+        for column, value in enumerate(stored):
+            if column == stretch_column:
+                continue
+            try:
+                width = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 70 <= width <= 500:
+                table.setColumnWidth(column, width)
+
+    def _save_column_widths(self, table, settings_key, stretch_column):
+        widths = []
+        for column in range(table.columnCount()):
+            width = table.columnWidth(column)
+            widths.append(max(70, min(500, width)))
+        # The stretch column is saved for completeness but never forcibly
+        # restored; its width is always determined by the available viewport.
+        self.settings.setValue(settings_key, widths)
+
+    def _layout_period_toolbar(self, compact):
+        while self.period_toolbar.count():
+            self.period_toolbar.takeAt(0)
+        for column in range(9):
+            self.period_toolbar.setColumnStretch(column, 0)
+        name_widgets = (
+            self.name_library_label,
+            self.new_person_input,
+            self.add_person_button,
+            self.rename_person_button,
+        )
+        record_widgets = (
+            self.add_row_button,
+            self.move_up_button,
+            self.move_down_button,
+            self.del_row_button,
+        )
+        for column, widget in enumerate(name_widgets):
+            self.period_toolbar.addWidget(widget, 0, column)
+        if compact:
+            for column, widget in enumerate(record_widgets):
+                self.period_toolbar.addWidget(widget, 1, column)
+            self.period_toolbar.setColumnStretch(4, 1)
+        else:
+            self.period_toolbar.setColumnStretch(4, 1)
+            for offset, widget in enumerate(record_widgets, start=5):
+                self.period_toolbar.addWidget(widget, 0, offset)
+
+    def _set_summary_expanded(self, expanded, persist=False):
+        expanded = bool(expanded)
+        blocker = QSignalBlocker(self.summary_toggle)
+        self.summary_toggle.setChecked(expanded)
+        del blocker
+        self.summary_toggle.setArrowType(
+            Qt.DownArrow if expanded else Qt.RightArrow
+        )
+        self.summary_text.setVisible(expanded)
+        if persist:
+            self.settings.setValue("ui/data_entry/summary_expanded", expanded)
+
+    def _on_summary_toggled(self, expanded):
+        self._summary_auto_mode = False
+        self._set_summary_expanded(expanded, persist=True)
+
+    def resizeEvent(self, event):
+        compact = self.width() < 880 or self.height() < 600
+        if hasattr(self, "period_toolbar") and compact != self._compact_mode:
+            self._compact_mode = compact
+            self._layout_period_toolbar(compact)
+        if hasattr(self, "summary_toggle") and self._summary_auto_mode:
+            self._set_summary_expanded(not compact, persist=False)
+        super().resizeEvent(event)
 
     def init_period_tab(self):
         layout = QVBoxLayout(self.period_tab)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(8)
         selector_card = QFrame()
         selector_card.setProperty("card", True)
         selector_layout = QHBoxLayout(selector_card)
@@ -286,60 +441,81 @@ class DataEntryTab(QWidget):
         self.half_combo.setMinimumWidth(96)
         selector_layout.addWidget(self.half_combo)
         latest_button = self._set_button_role(QPushButton("回到最新"), "secondary")
+        latest_button.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
         latest_button.clicked.connect(self.navigate_to_latest_period)
         selector_layout.addWidget(latest_button)
         selector_layout.addStretch()
         layout.addWidget(selector_card)
 
-        toolbar = QHBoxLayout()
-        toolbar.addWidget(QLabel("姓名库"))
+        self.period_toolbar = QGridLayout()
+        self.period_toolbar.setHorizontalSpacing(8)
+        self.period_toolbar.setVerticalSpacing(8)
+        self.name_library_label = QLabel("姓名库")
         self.new_person_input = QLineEdit()
         self.new_person_input.setPlaceholderText("输入新人员姓名")
         self.new_person_input.setMaximumWidth(170)
         self.new_person_input.returnPressed.connect(self.add_new_person)
-        toolbar.addWidget(self.new_person_input)
         self.add_person_button = self._set_button_role(QPushButton("新增人员"), "secondary")
         self.add_person_button.clicked.connect(self.add_new_person)
-        toolbar.addWidget(self.add_person_button)
         self.rename_person_button = self._set_button_role(QPushButton("重命名"), "secondary")
         self.rename_person_button.clicked.connect(self.open_rename_dialog)
-        toolbar.addWidget(self.rename_person_button)
-        toolbar.addStretch()
         self.add_row_button = self._set_button_role(QPushButton("新增记录"), "secondary")
         self.add_row_button.clicked.connect(self.add_row)
-        toolbar.addWidget(self.add_row_button)
         self.move_up_button = self._set_button_role(QPushButton("上移"), "secondary")
+        self.move_up_button.setIcon(self.style().standardIcon(QStyle.SP_ArrowUp))
         self.move_up_button.clicked.connect(self.move_row_up)
-        toolbar.addWidget(self.move_up_button)
         self.move_down_button = self._set_button_role(QPushButton("下移"), "secondary")
+        self.move_down_button.setIcon(self.style().standardIcon(QStyle.SP_ArrowDown))
         self.move_down_button.clicked.connect(self.move_row_down)
-        toolbar.addWidget(self.move_down_button)
         self.del_row_button = self._set_button_role(QPushButton("删除"), "danger")
+        self.del_row_button.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
         self.del_row_button.clicked.connect(self.delete_row)
-        toolbar.addWidget(self.del_row_button)
-        layout.addLayout(toolbar)
+        self._layout_period_toolbar(compact=False)
+        layout.addLayout(self.period_toolbar)
 
         self.table = QTableWidget()
-        self._configure_table(self.table, self.PERIOD_HEADERS)
+        self._configure_table(
+            self.table,
+            self.PERIOD_HEADERS,
+            stretch_column=1,
+            settings_key="ui/data_entry/period_column_widths",
+            dirty_callback=self._mark_period_dirty,
+            default_widths=(92, 150, 108, 90, 108, 90, 96, 96, 96),
+        )
         self.table.itemChanged.connect(self._on_period_item_changed)
         layout.addWidget(self.table, 1)
-        layout.addWidget(QLabel("本期总结"))
+        self.summary_toggle = QToolButton()
+        self.summary_toggle.setObjectName("summaryToggle")
+        self.summary_toggle.setText("本期总结")
+        self.summary_toggle.setCheckable(True)
+        self.summary_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.summary_toggle.toggled.connect(self._on_summary_toggled)
+        layout.addWidget(self.summary_toggle)
         self.summary_text = QTextEdit()
         self.summary_text.setPlaceholderText("记录本期重点、异常与后续行动")
         self.summary_text.setMinimumHeight(72)
         self.summary_text.setMaximumHeight(104)
         self.summary_text.textChanged.connect(self._mark_period_dirty)
         layout.addWidget(self.summary_text)
+        initial_summary_expanded = True
+        if not self._summary_auto_mode:
+            initial_summary_expanded = self.settings.value(
+                "ui/data_entry/summary_expanded", True, type=bool
+            )
+        self._set_summary_expanded(initial_summary_expanded, persist=False)
 
         footer = QHBoxLayout()
         self.period_dirty_label = QLabel("已保存")
         self.period_dirty_label.setProperty("state", "clean")
         footer.addWidget(self.period_dirty_label)
         self.refresh_button = self._set_button_role(QPushButton("重新加载"), "secondary")
+        self.refresh_button.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
         self.refresh_button.clicked.connect(self.reload_current_view)
         footer.addWidget(self.refresh_button)
         footer.addStretch()
         self.save_button = self._set_button_role(QPushButton("保存当前时期"), "primary")
+        self.save_button.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
+        self.save_button.setEnabled(False)
         self.save_button.clicked.connect(self.save_data)
         footer.addWidget(self.save_button)
         layout.addLayout(footer)
@@ -352,6 +528,8 @@ class DataEntryTab(QWidget):
 
     def init_person_tab(self):
         layout = QVBoxLayout(self.person_tab)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(8)
         selector_card = QFrame()
         selector_card.setProperty("card", True)
         selector_layout = QHBoxLayout(selector_card)
@@ -363,6 +541,11 @@ class DataEntryTab(QWidget):
         self.person_combo.setMinimumWidth(220)
         self.person_combo.setMaximumWidth(320)
         selector_layout.addWidget(self.person_combo)
+        self.add_person_from_person_button = self._set_button_role(
+            QPushButton("新增人员"), "secondary"
+        )
+        self.add_person_from_person_button.clicked.connect(self.prompt_add_person)
+        selector_layout.addWidget(self.add_person_from_person_button)
         selector_layout.addStretch()
         layout.addWidget(selector_card)
 
@@ -374,13 +557,23 @@ class DataEntryTab(QWidget):
         self.edit_person_period_button.clicked.connect(self.edit_person_period)
         toolbar.addWidget(self.edit_person_period_button)
         self.del_person_period_button = self._set_button_role(QPushButton("删除时期"), "danger")
+        self.del_person_period_button.setIcon(
+            self.style().standardIcon(QStyle.SP_TrashIcon)
+        )
         self.del_person_period_button.clicked.connect(self.delete_person_period)
         toolbar.addWidget(self.del_person_period_button)
         toolbar.addStretch()
         layout.addLayout(toolbar)
 
         self.person_table = QTableWidget()
-        self._configure_table(self.person_table, self.PERSON_HEADERS)
+        self._configure_table(
+            self.person_table,
+            self.PERSON_HEADERS,
+            stretch_column=1,
+            settings_key="ui/data_entry/person_column_widths",
+            dirty_callback=self._mark_person_dirty,
+            default_widths=(124, 150, 108, 90, 108, 90, 96, 96, 96),
+        )
         self.person_table.itemChanged.connect(self._on_person_item_changed)
         layout.addWidget(self.person_table, 1)
         footer = QHBoxLayout()
@@ -388,32 +581,56 @@ class DataEntryTab(QWidget):
         self.person_dirty_label.setProperty("state", "clean")
         footer.addWidget(self.person_dirty_label)
         self.reload_person_button = self._set_button_role(QPushButton("重新加载"), "secondary")
+        self.reload_person_button.setIcon(
+            self.style().standardIcon(QStyle.SP_BrowserReload)
+        )
         self.reload_person_button.clicked.connect(self.reload_current_view)
         footer.addWidget(self.reload_person_button)
         footer.addStretch()
         self.save_person_button = self._set_button_role(QPushButton("保存人员数据"), "primary")
+        self.save_person_button.setIcon(
+            self.style().standardIcon(QStyle.SP_DialogSaveButton)
+        )
+        self.save_person_button.setEnabled(False)
         self.save_person_button.clicked.connect(self.save_person_data)
         footer.addWidget(self.save_person_button)
         layout.addLayout(footer)
 
         self.refresh_person_list()
-        self.person_combo.activated[str].connect(self._on_person_requested)
+        self.person_combo.activated[int].connect(self._on_person_requested)
         if self.person_combo.lineEdit():
             self.person_combo.lineEdit().editingFinished.connect(self._on_person_requested)
         self.load_person_data()
 
     def _install_shortcuts(self):
-        definitions = (
+        page_definitions = (
             (QKeySequence.Save, self.save_current_view),
-            (QKeySequence(Qt.Key_Insert), self.add_current_row),
-            (QKeySequence("Ctrl+Delete"), self.delete_current_row),
-            (QKeySequence("Alt+Up"), self.move_row_up),
-            (QKeySequence("Alt+Down"), self.move_row_down),
             (QKeySequence.Refresh, self.reload_current_view),
         )
-        for sequence, callback in definitions:
+        for sequence, callback in page_definitions:
             shortcut = QShortcut(sequence, self)
             shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(callback)
+            self._shortcuts.append(shortcut)
+
+        # Row operations belong to the table itself.  WidgetShortcut keeps
+        # native editing keys such as Ctrl+Delete available in line edits and
+        # also disables these actions while a cell editor owns the focus.
+        table_definitions = (
+            (self.table, QKeySequence(Qt.Key_Insert), self.add_row),
+            (self.table, QKeySequence("Ctrl+Delete"), self.delete_row),
+            (self.table, QKeySequence("Alt+Up"), self.move_row_up),
+            (self.table, QKeySequence("Alt+Down"), self.move_row_down),
+            (self.person_table, QKeySequence(Qt.Key_Insert), self.add_person_period),
+            (
+                self.person_table,
+                QKeySequence("Ctrl+Delete"),
+                self.delete_person_period,
+            ),
+        )
+        for table, sequence, callback in table_definitions:
+            shortcut = QShortcut(sequence, table)
+            shortcut.setContext(Qt.WidgetShortcut)
             shortcut.activated.connect(callback)
             self._shortcuts.append(shortcut)
 
@@ -425,6 +642,56 @@ class DataEntryTab(QWidget):
 
     def delete_current_row(self):
         self.delete_row() if self.tabs.currentIndex() == 0 else self.delete_person_period()
+
+    @staticmethod
+    def _is_descendant(widget, ancestor):
+        current = widget
+        while current is not None:
+            if current is ancestor:
+                return True
+            current = current.parentWidget()
+        return False
+
+    def flush_active_editor(self):
+        """Synchronously copy an active table editor into its model item.
+
+        Qt normally commits only when editing ends.  A shortcut, close event,
+        or menu action may inspect dirty state first, so explicitly commit the
+        editor without requiring the user to click elsewhere.
+        """
+
+        focus = QApplication.focusWidget()
+        if focus is None:
+            return True
+        for kind, table in (("period", self.table), ("person", self.person_table)):
+            if (
+                table.state() != QAbstractItemView.EditingState
+                or not self._is_descendant(focus, table)
+            ):
+                continue
+            editor = focus
+            while (
+                editor.parentWidget() is not None
+                and editor.parentWidget() is not table.viewport()
+                and editor.parentWidget() is not table
+            ):
+                editor = editor.parentWidget()
+            index = table.currentIndex()
+            before = index.data(Qt.EditRole) if index.isValid() else None
+            try:
+                table.commitData(editor)
+            except (RuntimeError, TypeError):
+                # Custom delegates can still be committed directly if a style
+                # inserted an intermediate editor container.
+                delegate = table.itemDelegate(index) if index.isValid() else None
+                if delegate is None:
+                    return False
+                delegate.setModelData(editor, table.model(), index)
+            after = index.data(Qt.EditRole) if index.isValid() else None
+            if before != after:
+                self._set_period_dirty(True) if kind == "period" else self._set_person_dirty(True)
+            return True
+        return True
 
     def has_unsaved_changes(self):
         return self._period_dirty or self._person_dirty
@@ -468,6 +735,8 @@ class DataEntryTab(QWidget):
         for label in (self.period_dirty_label, self.person_dirty_label):
             label.style().unpolish(label)
             label.style().polish(label)
+        self.save_button.setEnabled(self._period_dirty)
+        self.save_person_button.setEnabled(self._person_dirty)
         self.dirtyChanged.emit(self.has_unsaved_changes())
 
     def _set_period_dirty(self, dirty):
@@ -489,6 +758,7 @@ class DataEntryTab(QWidget):
             self._set_person_dirty(True)
 
     def _resolve_dirty(self, kind):
+        self.flush_active_editor()
         dirty = self._period_dirty if kind == "period" else self._person_dirty
         if not dirty:
             return True
@@ -510,10 +780,15 @@ class DataEntryTab(QWidget):
             return self.save_data() if kind == "period" else self.save_person_data()
         if clicked is discard_button:
             self.load_period_data() if kind == "period" else self.load_person_data()
+            self.statusMessage.emit(
+                "已放弃当前时期的更改" if kind == "period" else "已放弃当前人员的更改",
+                3000,
+            )
             return True
         return False
 
     def resolve_pending_changes(self):
+        self.flush_active_editor()
         if self._period_dirty and not self._resolve_dirty("period"):
             return False
         if self._person_dirty and not self._resolve_dirty("person"):
@@ -567,6 +842,7 @@ class DataEntryTab(QWidget):
     def navigate_to_latest_period(self):
         # Saving the current dirty page can itself create a new latest period.
         # Resolve it first, then query the authoritative store exactly once.
+        self.flush_active_editor()
         if self._period_dirty and not self._resolve_dirty("period"):
             return
         requested = self.db.get_latest_performance_period()
@@ -624,22 +900,164 @@ class DataEntryTab(QWidget):
             text = repr(numeric)
         item = QTableWidgetItem(text)
         item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        item.setToolTip(text)
         return item
+
+    def _person_registry_options(self):
+        active_names = {
+            name for name in self.db.get_all_names(active_only=True) if name
+        }
+        all_names = [
+            name for name in self.db.get_all_names(active_only=False) if name
+        ]
+        options = []
+        for name in all_names:
+            inactive = name not in active_names
+            if inactive:
+                try:
+                    if not self.db.get_all_data_by_name(name):
+                        continue
+                except Exception:
+                    # A legacy repository without a history query should still
+                    # expose the name rather than make existing records unusable.
+                    pass
+            label = f"{name}（停用）" if inactive else name
+            options.append((name, label, inactive))
+        return options
+
+    @staticmethod
+    def _add_person_option(combo, raw_name, label, inactive=False):
+        combo.addItem(label, raw_name)
+        index = combo.count() - 1
+        if inactive:
+            combo.setItemData(index, QColor("#6B7280"), Qt.ForegroundRole)
+            combo.setItemData(index, "该人员已停用，但仍有历史数据", Qt.ToolTipRole)
+
+    def _populate_name_combo(
+        self, combo, current_name="", include_blank=True, show_status_suffix=False
+    ):
+        blocker = QSignalBlocker(combo)
+        combo.clear()
+        if include_blank:
+            self._add_person_option(combo, "", "")
+        known = set()
+        for raw_name, label, inactive in self._person_registry_options():
+            known.add(raw_name)
+            self._add_person_option(
+                combo,
+                raw_name,
+                label if show_status_suffix else raw_name,
+                inactive,
+            )
+        if current_name and current_name not in known:
+            self._add_person_option(
+                combo,
+                current_name,
+                f"{current_name}（停用）" if show_status_suffix else current_name,
+                inactive=True,
+            )
+        index = combo.findData(current_name, Qt.UserRole)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        elif not include_blank and combo.count():
+            combo.setCurrentIndex(0)
+        else:
+            combo.setCurrentIndex(0 if include_blank else -1)
+        del blocker
+
+    @staticmethod
+    def _combo_person_key(combo, requested=None):
+        if not isinstance(combo, QComboBox):
+            return ""
+        if isinstance(requested, int):
+            value = combo.itemData(requested, Qt.UserRole)
+            if value is None:
+                value = combo.itemText(requested)
+            return str(value or "").strip()
+        if requested is not None:
+            text = str(requested).strip()
+            for index in range(combo.count()):
+                raw = str(combo.itemData(index, Qt.UserRole) or "").strip()
+                if text in (raw, combo.itemText(index).strip()):
+                    return raw
+            return ""
+        index = combo.currentIndex()
+        typed_text = combo.currentText().strip()
+        if index < 0 or typed_text != combo.itemText(index).strip():
+            for option_index in range(combo.count()):
+                raw = combo.itemData(option_index, Qt.UserRole)
+                if raw is None:
+                    raw = combo.itemText(option_index)
+                if typed_text in (
+                    str(raw or "").strip(),
+                    combo.itemText(option_index).strip(),
+                ):
+                    return str(raw or "").strip()
+            return ""
+        value = combo.itemData(index, Qt.UserRole)
+        if value is None:
+            value = combo.itemText(index)
+        return str(value or "").strip()
+
+    def _set_person_selection(self, name):
+        blocker = QSignalBlocker(self.person_combo)
+        index = self.person_combo.findData(name, Qt.UserRole)
+        self.person_combo.setCurrentIndex(index)
+        if index < 0 and self.person_combo.lineEdit():
+            self.person_combo.lineEdit().clear()
+        del blocker
 
     def _name_combo(self, current_name=""):
         combo = QComboBox()
-        names = list(self.db.get_all_names())
-        if "" not in names:
-            names.insert(0, "")
-        if current_name and current_name not in names:
-            names.append(current_name)
-        combo.addItems(names)
-        combo.setCurrentText(current_name)
+        combo.setObjectName("recordPersonCombo")
+        self._populate_name_combo(combo, current_name)
         combo.currentTextChanged.connect(self._mark_period_dirty)
         return combo
 
+    @staticmethod
+    def _capture_table_state(table, key_for_row):
+        row = table.currentRow()
+        column = table.currentColumn()
+        return {
+            "row": row,
+            "column": column,
+            "key": key_for_row(row) if row >= 0 else "",
+            "vertical": table.verticalScrollBar().value(),
+            "horizontal": table.horizontalScrollBar().value(),
+        }
+
+    @staticmethod
+    def _restore_table_state(table, state, key_for_row):
+        if not state or not table.rowCount():
+            return
+        target_row = -1
+        key = state.get("key", "")
+        if key:
+            for row in range(table.rowCount()):
+                if key_for_row(row) == key:
+                    target_row = row
+                    break
+        if target_row < 0:
+            old_row = int(state.get("row", -1))
+            if old_row >= 0:
+                target_row = min(old_row, table.rowCount() - 1)
+        if target_row >= 0:
+            column = max(0, min(int(state.get("column", 0)), table.columnCount() - 1))
+            table.setCurrentCell(target_row, column)
+        table.verticalScrollBar().setValue(int(state.get("vertical", 0)))
+        table.horizontalScrollBar().setValue(int(state.get("horizontal", 0)))
+
+    def _period_row_key(self, row):
+        combo = self.table.cellWidget(row, 1) if row >= 0 else None
+        return self._combo_person_key(combo)
+
+    def _person_row_key(self, row):
+        item = self.person_table.item(row, 0) if row >= 0 else None
+        return item.text().strip() if item else ""
+
     def load_period_data(self):
         period = self.get_current_period()
+        view_state = self._capture_table_state(self.table, self._period_row_key)
         self._loading = True
         try:
             data = self.db.get_data_by_period(period)
@@ -665,6 +1083,7 @@ class DataEntryTab(QWidget):
             self._period_view_stale = False
         finally:
             self._loading = False
+        self._restore_table_state(self.table, view_state, self._period_row_key)
         self._set_period_dirty(False)
 
     def add_row(self, checked=False, mark_dirty=True):
@@ -681,6 +1100,10 @@ class DataEntryTab(QWidget):
         self.table.setCurrentCell(row, 0)
         if mark_dirty and not self._loading:
             self._set_period_dirty(True)
+            self.table.setCurrentCell(row, 1)
+            combo = self.table.cellWidget(row, 1)
+            if combo:
+                combo.setFocus(Qt.ShortcutFocusReason)
 
     def add_new_person(self):
         new_name = self.new_person_input.text().strip()
@@ -688,10 +1111,31 @@ class DataEntryTab(QWidget):
             QMessageBox.warning(self, "输入错误", "请输入新人员姓名。")
             self.new_person_input.setFocus()
             return
+        if self._create_person(new_name):
+            self.new_person_input.clear()
+
+    def prompt_add_person(self):
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle("新增人员")
+        dialog.setLabelText("人员姓名：")
+        dialog.setTextEchoMode(QLineEdit.Normal)
+        dialog.setOkButtonText("确定")
+        dialog.setCancelButtonText("取消")
+        if dialog.exec_() == QDialog.Accepted:
+            self._create_person(dialog.textValue())
+
+    def _create_person(self, new_name):
+        new_name = str(new_name or "").strip()
+        if not new_name:
+            QMessageBox.warning(self, "输入错误", "请输入新人员姓名。")
+            return False
         if new_name in self.db.get_all_names():
             self.statusMessage.emit(f"人员“{new_name}”已存在", 3000)
-            self.new_person_input.clear()
-            return
+            return False
+        if self.tabs.currentIndex() == 1:
+            self.flush_active_editor()
+            if self._person_dirty and not self._resolve_dirty("person"):
+                return False
         mutation = self.db.add_name_to_all_names(new_name)
         committed, mirror_ok = _mutation_status(mutation)
         if not committed:
@@ -704,8 +1148,7 @@ class DataEntryTab(QWidget):
                 f"无法添加人员“{new_name}”。"
                 + (f"\n\n{detail}" if detail else ""),
             )
-            return
-        self.new_person_input.clear()
+            return False
         self.refresh_name_combos()
         self.invalidate_views("person")
         self.refresh_views(
@@ -721,18 +1164,19 @@ class DataEntryTab(QWidget):
             QMessageBox.warning(
                 self, "CSV 镜像更新失败", mirror_error or "人员已添加，但 CSV 镜像未更新。"
             )
+        return True
 
     def _current_period_row_name(self):
         row = self.table.currentRow()
         combo = self.table.cellWidget(row, 1) if row >= 0 else None
-        return combo.currentText().strip() if isinstance(combo, QComboBox) else ""
+        return self._combo_person_key(combo)
 
     def open_rename_dialog(self):
         if not self.resolve_pending_changes():
             return
         initial_name = self._current_period_row_name()
         if self.tabs.currentIndex() == 1:
-            initial_name = self.person_combo.currentText().strip()
+            initial_name = self._loaded_person
         dialog = RenamePersonDialog(self, self.db, initial_name=initial_name)
         if dialog.exec_() == QDialog.Accepted and dialog.rename_succeeded:
             self.invalidate_views()
@@ -742,19 +1186,12 @@ class DataEntryTab(QWidget):
             self.statusMessage.emit(f"已将“{dialog.old_name}”重命名为“{dialog.new_name}”", 5000)
 
     def refresh_name_combos(self):
-        names = list(self.db.get_all_names())
-        if "" not in names:
-            names.insert(0, "")
         for row in range(self.table.rowCount()):
             combo = self.table.cellWidget(row, 1)
             if not isinstance(combo, QComboBox):
                 continue
-            current = combo.currentText()
-            blocker = QSignalBlocker(combo)
-            combo.clear()
-            combo.addItems(names + ([current] if current and current not in names else []))
-            combo.setCurrentText(current)
-            del blocker
+            current = self._combo_person_key(combo)
+            self._populate_name_combo(combo, current)
 
     def delete_row(self):
         row = self.table.currentRow()
@@ -762,7 +1199,7 @@ class DataEntryTab(QWidget):
             QMessageBox.warning(self, "未选择记录", "请先选择要删除的记录。")
             return
         combo = self.table.cellWidget(row, 1)
-        name = combo.currentText().strip() if isinstance(combo, QComboBox) else ""
+        name = DataEntryTab._combo_person_key(combo)
         if name:
             reply = QMessageBox.question(
                 self, "确认删除", f"确认从 {self.get_current_period()} 移除 {name} 吗？\n保存当前时期后生效。",
@@ -771,6 +1208,10 @@ class DataEntryTab(QWidget):
             if reply != QMessageBox.Yes:
                 return
         self.table.removeRow(row)
+        if self.table.rowCount():
+            self.table.setCurrentCell(
+                min(row, self.table.rowCount() - 1), max(0, self.table.currentColumn())
+            )
         if hasattr(self, "_set_period_dirty"):
             self._set_period_dirty(True)
 
@@ -778,21 +1219,52 @@ class DataEntryTab(QWidget):
         if self._loading or self._validation_guard or item.column() not in performance_columns | order_columns:
             return True
         text = item.text().strip()
-        valid = True
-        if text:
-            try:
-                _parse_numeric_text(
-                    text, integer=item.column() in order_columns
-                )
-            except ValueError:
-                valid = False
+        error = self._numeric_validation_error(
+            text, integer=item.column() in order_columns
+        )
+        valid = not error
         self._validation_guard = True
         blocker = QSignalBlocker(table)
         item.setBackground(QColor("#FEF2F2") if not valid else QColor(Qt.transparent))
-        item.setToolTip("请输入有效数字" if not valid else "")
+        item.setToolTip(error if not valid else text)
         del blocker
         self._validation_guard = False
         return valid
+
+    @staticmethod
+    def _numeric_validation_error(text, integer=False):
+        text = str(text or "").strip()
+        if not text:
+            return ""
+        if "," in text:
+            return "不支持千分位分隔符，请直接输入数字"
+        lowered = text.casefold()
+        if lowered in {"nan", "+nan", "-nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity"}:
+            return "不允许 NaN 或无穷大"
+        if integer:
+            digits = text[1:] if text[:1] in ("+", "-") else text
+            if not digits or not digits.isascii() or not digits.isdigit():
+                try:
+                    float(text)
+                except (TypeError, ValueError):
+                    return "请输入有效整数"
+                return "订单只接受整数"
+            try:
+                value = int(text, 10)
+            except ValueError:
+                return "请输入有效整数"
+            if not SQLITE_INT64_MIN <= value <= SQLITE_INT64_MAX:
+                return "整数超出 SQLite 64 位范围"
+            return ""
+        try:
+            value = float(text)
+        except (TypeError, ValueError):
+            return "请输入有效数字"
+        if not math.isfinite(value):
+            return "不允许 NaN 或无穷大"
+        if _numeric_validator(False).validate(text, 0)[0] != QValidator.Acceptable:
+            return "请输入有效数字（小数请使用英文句点）"
+        return ""
 
     def _on_period_item_changed(self, item):
         self._validate_numeric_item(self.table, item, {2, 4}, {3, 5})
@@ -808,20 +1280,32 @@ class DataEntryTab(QWidget):
         text = item.text().strip() if item else ""
         if not text:
             return 0
+        error = DataEntryTab._numeric_validation_error(text, integer=cast is int)
+        if error:
+            table.setCurrentCell(row, column)
+            if item:
+                table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+            raise ValueError(
+                f"第 {row + 1} 行“{table.horizontalHeaderItem(column).text()}”：{error}"
+            )
         try:
             if cast in (float, int):
                 return _parse_numeric_text(text, integer=cast is int)
             return cast(text)
         except ValueError:
+            table.setCurrentCell(row, column)
+            if item:
+                table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
             raise ValueError(f"第 {row + 1} 行“{table.horizontalHeaderItem(column).text()}”格式无效")
 
     def save_data(self):
+        self.flush_active_editor()
         period = self._loaded_period or self.get_current_period()
         try:
             records = []
             for row in range(self.table.rowCount()):
                 combo = self.table.cellWidget(row, 1)
-                name = combo.currentText().strip() if isinstance(combo, QComboBox) else ""
+                name = self._combo_person_key(combo)
                 populated = any(
                     self.table.item(row, column) and self.table.item(row, column).text().strip()
                     for column in range(0, 6) if column != 1
@@ -927,37 +1411,35 @@ class DataEntryTab(QWidget):
             current = (
                 preferred_name
                 or self._loaded_person
-                or self.person_combo.currentText().strip()
+                or self._combo_person_key(self.person_combo)
             )
         else:
             current = preferred_name or ""
-        names = [name for name in self.db.get_all_names() if name]
-        blocker = QSignalBlocker(self.person_combo)
-        self.person_combo.clear()
-        self.person_combo.addItems(names)
-        if current:
-            if current in names:
-                self.person_combo.setCurrentText(current)
-            elif preserve_current:
-                self.person_combo.addItem(current)
-                self.person_combo.setCurrentText(current)
-        del blocker
+        self._populate_name_combo(
+            self.person_combo,
+            current,
+            include_blank=False,
+            show_status_suffix=True,
+        )
 
     def _on_person_requested(self, requested=None):
         if self._loading:
             return
-        requested = str(requested or self.person_combo.currentText()).strip()
-        if requested == self._loaded_person:
+        requested_key = self._combo_person_key(self.person_combo, requested)
+        if not requested_key and self.person_combo.currentText().strip():
+            self._set_person_selection(self._loaded_person)
+            self.statusMessage.emit(
+                "请选择列表中的已有人员；新增人员请使用“新增人员”按钮", 4000
+            )
+            return
+        if requested_key == self._loaded_person:
+            self._set_person_selection(self._loaded_person)
             return
         if self._person_dirty:
-            blocker = QSignalBlocker(self.person_combo)
-            self.person_combo.setCurrentText(self._loaded_person)
-            del blocker
+            self._set_person_selection(self._loaded_person)
             if not self._resolve_dirty("person"):
                 return
-            blocker = QSignalBlocker(self.person_combo)
-            self.person_combo.setCurrentText(requested)
-            del blocker
+            self._set_person_selection(requested_key)
         self.load_person_data()
 
     def _insert_person_row(self, row_data=None, period=None):
@@ -994,7 +1476,11 @@ class DataEntryTab(QWidget):
         return row
 
     def load_person_data(self):
-        name = self.person_combo.currentText().strip()
+        name = self._combo_person_key(self.person_combo)
+        if not name and self.person_combo.currentText().strip():
+            self._set_person_selection(self._loaded_person)
+            name = self._loaded_person
+        view_state = self._capture_table_state(self.person_table, self._person_row_key)
         self._loading = True
         try:
             self.person_table.setRowCount(0)
@@ -1006,6 +1492,7 @@ class DataEntryTab(QWidget):
             self._person_view_stale = False
         finally:
             self._loading = False
+        self._restore_table_state(self.person_table, view_state, self._person_row_key)
         self._set_person_dirty(False)
 
     def _suggest_next_period(self):
@@ -1040,8 +1527,8 @@ class DataEntryTab(QWidget):
             return None
 
     def add_person_period(self):
-        if not self.person_combo.currentText().strip():
-            QMessageBox.warning(self, "未选择人员", "请先选择或输入人员姓名。")
+        if not self._loaded_person:
+            QMessageBox.warning(self, "未选择人员", "请先选择已有人员。")
             return
         suggested_period = self._suggest_next_period()
         if self.person_table.rowCount() and suggested_period is None:
@@ -1065,6 +1552,9 @@ class DataEntryTab(QWidget):
         row = self._insert_person_row(period=period)
         self.person_table.setCurrentCell(row, 1)
         self._set_person_dirty(True)
+        position_item = self.person_table.item(row, 1)
+        if position_item:
+            self.person_table.editItem(position_item)
 
     def edit_person_period(self):
         row = self.person_table.currentRow()
@@ -1091,7 +1581,7 @@ class DataEntryTab(QWidget):
             return
         item = self.person_table.item(row, 0)
         period = item.text().strip() if item else ""
-        name = self.person_combo.currentText().strip()
+        name = self._loaded_person
         if period:
             reply = QMessageBox.question(
                 self, "确认删除", f"确认删除 {name} 在 {period} 的记录吗？\n保存人员数据后生效。",
@@ -1103,12 +1593,30 @@ class DataEntryTab(QWidget):
         if original_period:
             self._person_deleted_periods.add(original_period)
         self.person_table.removeRow(row)
+        if self.person_table.rowCount():
+            self.person_table.setCurrentCell(
+                min(row, self.person_table.rowCount() - 1),
+                max(0, self.person_table.currentColumn()),
+            )
         self._set_person_dirty(True)
 
     def save_person_data(self):
-        name = self.person_combo.currentText().strip()
+        if hasattr(self, "flush_active_editor"):
+            self.flush_active_editor()
+        selected_name = DataEntryTab._combo_person_key(self.person_combo)
+        name = getattr(self, "_loaded_person", "") or selected_name
         if not name:
-            QMessageBox.warning(self, "未选择人员", "请选择或输入人员姓名。")
+            QMessageBox.warning(self, "未选择人员", "请选择已有人员。")
+            return False
+        if selected_name != name:
+            if hasattr(self, "_set_person_selection"):
+                self._set_person_selection(name)
+            QMessageBox.warning(
+                self,
+                "人员不匹配",
+                "人员选择已变化，当前表格仍属于“{}”。\n"
+                "为防止覆盖其他人员的数据，本次保存已取消。".format(name),
+            )
             return False
         try:
             records = []
@@ -1192,6 +1700,7 @@ class DataEntryTab(QWidget):
         return True
 
     def reload_current_view(self):
+        self.flush_active_editor()
         kind = "period" if self.tabs.currentIndex() == 0 else "person"
         dirty = self._period_dirty if kind == "period" else self._person_dirty
         if dirty:
