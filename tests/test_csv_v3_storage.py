@@ -7,6 +7,7 @@ from unittest.mock import patch
 from csv_codec import (
     CsvCodec,
     CsvNameRecord,
+    CsvPositionRecord,
     CsvPerformanceRecord,
     CsvSnapshot,
     CsvSummaryRecord,
@@ -65,6 +66,10 @@ class CsvV3CodecTests(unittest.TestCase):
                 CsvNameRecord("[Team]", "", 1),
                 CsvNameRecord("# 格式版本:", "", 1),
             ),
+            positions=(
+                CsvPositionRecord("营销经理", 1),
+                CsvPositionRecord("旧职级", 0),
+            ),
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "snapshot.csv"
@@ -76,8 +81,10 @@ class CsvV3CodecTests(unittest.TestCase):
         self.assertNotIn("编号", text)
         self.assertNotIn("增长%", text)
         self.assertNotIn("创建时间", text)
+        self.assertIn("[ALL_POSITIONS]", text)
         self.assertTrue(plan.valid, plan.error)
         self.assertEqual(plan.performance_count, 3)
+        self.assertEqual(plan.position_count, 2)
         self.assertEqual(
             [item.name for item in plan.snapshot.performance],
             ["[ALL_NAMES]", "[Team]", "# 格式版本:"],

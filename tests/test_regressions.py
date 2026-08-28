@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication, QComboBox, QMessageBox, QTableWidget, QTableWidgetItem
 
-from database import DatabaseManager
+from database import DEFAULT_POSITIONS, DatabaseManager
 from main import get_application_data_dir
 from ui.data_entry_tab import DataEntryTab
 
@@ -31,6 +31,40 @@ class DatabaseRegressionTests(unittest.TestCase):
 
     def tearDown(self):
         self.db.close()
+
+    def test_position_registry_has_defaults_and_supports_deactivation(self):
+        self.assertEqual(
+            tuple(item for item in self.db.get_all_positions() if item),
+            DEFAULT_POSITIONS,
+        )
+        self.assertTrue(self.db.add_position("区域总监"))
+        self.assertIn("区域总监", self.db.get_all_positions())
+        self.assertTrue(self.db.deactivate_position("区域总监"))
+        self.assertNotIn("区域总监", self.db.get_all_positions())
+        self.assertIn(
+            "区域总监", self.db.get_all_positions(active_only=False)
+        )
+
+    def test_csv_roundtrip_preserves_unused_inactive_position(self):
+        self.db.add_position("区域总监")
+        self.db.deactivate_position("区域总监")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "positions.csv"
+            self.assertTrue(self.db.export_to_csv(csv_path))
+            self.assertIn(
+                "[ALL_POSITIONS]",
+                csv_path.read_text(encoding="utf-8-sig"),
+            )
+            restored = DatabaseManager(":memory:", auto_backup=False)
+            try:
+                self.assertTrue(restored.import_from_csv(csv_path))
+                self.assertIn(
+                    "区域总监",
+                    restored.get_all_positions(active_only=False),
+                )
+                self.assertNotIn("区域总监", restored.get_all_positions())
+            finally:
+                restored.close()
 
     def test_period_save_rejects_duplicate_names_without_data_loss(self):
         period = "2026-01-上"

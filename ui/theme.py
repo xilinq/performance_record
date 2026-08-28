@@ -5,14 +5,65 @@ sheet properties so the packaged application has the same visual hierarchy on
 Windows 7 and Windows 11. Arrow indicators are left to QStyle.
 """
 
+from PyQt5.QtCore import QEvent, QObject
 from PyQt5.QtGui import QColor, QFont, QFontDatabase, QPalette
-from PyQt5.QtWidgets import QApplication, QStyleFactory
+from PyQt5.QtWidgets import QApplication, QComboBox, QStyleFactory, QWidget
 
 
 FONT_FALLBACKS = ("Microsoft YaHei UI", "Microsoft YaHei", "SimSun")
 DEFAULT_FONT_SIZE = 10
 CONTENT_MARGIN = 10
 CONTROL_SPACING = 8
+
+
+class ComboBoxWheelGuard(QObject):
+    """Prevent a wheel hovering over a closed combo from changing its value."""
+
+    @staticmethod
+    def _owning_combo(widget):
+        current = widget if isinstance(widget, QWidget) else None
+        while current is not None:
+            if isinstance(current, QComboBox):
+                return current
+            current = current.parentWidget()
+        return None
+
+    @staticmethod
+    def _is_descendant_of(widget, ancestor):
+        current = widget if isinstance(widget, QWidget) else None
+        while current is not None:
+            if current is ancestor:
+                return True
+            current = current.parentWidget()
+        return False
+
+    def eventFilter(self, watched, event):
+        if event.type() != QEvent.Wheel:
+            return False
+        combo = self._owning_combo(watched)
+        if combo is None:
+            return False
+        # The popup list may still be scrolled to reach an item; selection is
+        # committed only by clicking.  The closed combo and its line edit must
+        # never change merely because the pointer happens to hover over them.
+        view = combo.view()
+        if view is not None and self._is_descendant_of(watched, view):
+            return False
+        event.ignore()
+        return True
+
+
+def install_combo_box_wheel_guard(app):
+    """Install one application-wide guard and retain it for the app lifetime."""
+
+    if not isinstance(app, QApplication):
+        raise TypeError("app must be a QApplication instance")
+    guard = getattr(app, "_combo_box_wheel_guard", None)
+    if guard is None:
+        guard = ComboBoxWheelGuard(app)
+        app.installEventFilter(guard)
+        app._combo_box_wheel_guard = guard
+    return guard
 
 
 APP_STYLE_SHEET = """
@@ -566,4 +617,5 @@ def apply_theme(app):
     app.setPalette(palette)
     app.setStyleSheet(APP_STYLE_SHEET)
     app.setProperty("themeFontFamily", family)
+    install_combo_box_wheel_guard(app)
     return family

@@ -112,15 +112,23 @@ class CsvNameRecord:
 
 
 @dataclass(frozen=True)
+class CsvPositionRecord:
+    position: str
+    is_active: int = 1
+
+
+@dataclass(frozen=True)
 class CsvSnapshot:
     performance: Tuple[CsvPerformanceRecord, ...] = field(default_factory=tuple)
     summaries: Tuple[CsvSummaryRecord, ...] = field(default_factory=tuple)
     names: Tuple[CsvNameRecord, ...] = field(default_factory=tuple)
+    positions: Tuple[CsvPositionRecord, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "performance", tuple(self.performance))
         object.__setattr__(self, "summaries", tuple(self.summaries))
         object.__setattr__(self, "names", tuple(self.names))
+        object.__setattr__(self, "positions", tuple(self.positions))
 
 
 @dataclass(frozen=True)
@@ -150,6 +158,10 @@ class ImportPlan(Mapping[str, Any]):
     def name_count(self) -> int:
         return len(self.snapshot.names) if self.snapshot else 0
 
+    @property
+    def position_count(self) -> int:
+        return len(self.snapshot.positions) if self.snapshot else 0
+
     def _summary(self) -> Dict[str, Any]:
         return {
             "valid": self.valid,
@@ -159,6 +171,7 @@ class ImportPlan(Mapping[str, Any]):
             "performance_count": self.performance_count,
             "summary_count": self.summary_count,
             "name_count": self.name_count,
+            "position_count": self.position_count,
             # A copy preserves the historical dict/list-facing API without
             # exposing the frozen tuple for mutation.
             "warnings": list(self.warnings),
@@ -185,6 +198,7 @@ class CsvCodec:
     PERFORMANCE_MARKER = "[PERFORMANCE_DATA]"
     SUMMARY_MARKER = "[SUMMARY_DATA]"
     NAMES_MARKER = "[ALL_NAMES]"
+    POSITIONS_MARKER = "[ALL_POSITIONS]"
 
     _ALIASES = {
         "number": {"编号", "number"},
@@ -235,6 +249,7 @@ class CsvCodec:
             cls.PERFORMANCE_MARKER,
             cls.SUMMARY_MARKER,
             cls.NAMES_MARKER,
+            cls.POSITIONS_MARKER,
         }
         for index in range(marker_index + 1, len(rows)):
             if (
@@ -551,10 +566,56 @@ class CsvCodec:
             for name in missing_roster_names:
                 names_by_name[name] = CsvNameRecord(name)
 
+            positions_header, positions_rows = cls._section(
+                rows, cls.POSITIONS_MARKER
+            )
+            parsed_positions = []
+            if positions_header is None:
+                # The position registry was added without changing the v3 raw
+                # business-data contract.  Existing v3 files remain valid;
+                # DatabaseManager reconstructs used positions and defaults.
+                if format_version >= 3:
+                    warnings.append(
+                        "文件未包含职级库，导入时将从业绩记录和默认职级重建"
+                    )
+            else:
+                position_columns = cls._column_map(positions_header)
+                if position_columns["position"] is None:
+                    raise ValueError("职级库缺少职级列")
+                if position_columns["is_active"] is None:
+                    raise ValueError("职级库缺少是否启用列")
+                seen_positions = set()
+                for row_number, row in enumerate(positions_rows, start=1):
+                    try:
+                        position = cls._cell(
+                            row, position_columns["position"]
+                        ).strip()
+                        if not position:
+                            raise ValueError("职级不能为空")
+                        if position in seen_positions:
+                            raise ValueError(f"存在重复职级：{position}")
+                        seen_positions.add(position)
+                        is_active = _coerce_int(
+                            cls._cell(row, position_columns["is_active"], "1"),
+                            "是否启用",
+                        )
+                        if is_active not in (0, 1):
+                            raise ValueError("是否启用只能是 0 或 1")
+                        parsed_positions.append(
+                            CsvPositionRecord(position=position, is_active=is_active)
+                        )
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"职级库第 {row_number} 行：{exc}"
+                        ) from exc
+
             snapshot = CsvSnapshot(
                 performance=tuple(normalized_performance),
                 summaries=tuple(sorted(parsed_summaries, key=lambda item: item.period)),
                 names=tuple(sorted(names_by_name.values(), key=lambda item: item.name)),
+                positions=tuple(
+                    sorted(parsed_positions, key=lambda item: item.position)
+                ),
             )
             return ImportPlan(
                 valid=True,
@@ -642,10 +703,27 @@ class CsvCodec:
         for record in performance:
             names_by_name.setdefault(record.name, CsvNameRecord(record.name))
 
+        positions_by_name = {}
+        for source in snapshot.positions:
+            position = str(source.position or "").strip()
+            if not position:
+                raise ValueError("职级库中的职级不能为空")
+            if position in positions_by_name:
+                raise ValueError(f"存在重复职级：{position}")
+            is_active = _coerce_int(source.is_active, "是否启用")
+            if is_active not in (0, 1):
+                raise ValueError("是否启用只能是 0 或 1")
+            positions_by_name[position] = CsvPositionRecord(
+                position=position, is_active=is_active
+            )
+
         return CsvSnapshot(
             performance=tuple(performance),
             summaries=tuple(sorted(summaries, key=lambda item: item.period)),
             names=tuple(sorted(names_by_name.values(), key=lambda item: item.name)),
+            positions=tuple(
+                sorted(positions_by_name.values(), key=lambda item: item.position)
+            ),
         )
 
     @classmethod
@@ -714,6 +792,12 @@ class CsvCodec:
                 for person in normalized.names:
                     writer.writerow([person.name, person.is_active])
 
+                writer.writerow([])
+                writer.writerow([cls.POSITIONS_MARKER])
+                writer.writerow(["职级", "是否启用"])
+                for position in normalized.positions:
+                    writer.writerow([position.position, position.is_active])
+
                 temporary_file.flush()
                 os.fsync(temporary_file.fileno())
             os.replace(str(temporary_path), str(target))
@@ -736,6 +820,7 @@ __all__ = [
     "CsvPerformanceRecord",
     "CsvSummaryRecord",
     "CsvNameRecord",
+    "CsvPositionRecord",
     "CsvSnapshot",
     "ImportPlan",
     "CsvCodec",

@@ -5,7 +5,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from unittest.mock import patch
 
 import run_tests
 from runtime_bootstrap import (
@@ -99,6 +98,83 @@ class SafeTestRunnerTests(unittest.TestCase):
             "tests.test_csv_v3_storage",
         )
 
+    def test_fixed_win7_python_org_environment_is_accepted(self):
+        self.assertTrue(
+            run_tests._is_win7_release_test_environment(
+                environ={},
+                platform_name="win32",
+                version_info=(3, 8, 10),
+                windows_version=("7", "6.1.7601", "SP1", "Multiprocessor Free"),
+                machine="AMD64",
+                max_size=2**63 - 1,
+            )
+        )
+
+    def test_win7_release_environment_rejects_conda_or_wrong_baseline(self):
+        valid_arguments = {
+            "platform_name": "win32",
+            "version_info": (3, 8, 10),
+            "windows_version": ("7", "6.1.7601", "SP1", "Multiprocessor Free"),
+            "machine": "AMD64",
+            "max_size": 2**63 - 1,
+        }
+        self.assertFalse(
+            run_tests._is_win7_release_test_environment(
+                environ={"CONDA_PREFIX": r"C:\\conda"},
+                **valid_arguments
+            )
+        )
+        self.assertFalse(
+            run_tests._is_win7_release_test_environment(
+                environ={},
+                version_info=(3, 8, 20),
+                **{
+                    key: value
+                    for key, value in valid_arguments.items()
+                    if key != "version_info"
+                }
+            )
+        )
+
+    def test_explicit_cross_build_environment_requires_flag_and_exact_baseline(self):
+        valid_arguments = {
+            "platform_name": "win32",
+            "version_info": (3, 8, 10),
+            "machine": "AMD64",
+            "max_size": 2**63 - 1,
+        }
+        self.assertTrue(
+            run_tests._is_explicit_cross_build_test_environment(
+                environ={"PERFORMANCE_ALLOW_WIN11_CROSS_BUILD": "1"},
+                **valid_arguments
+            )
+        )
+        self.assertFalse(
+            run_tests._is_explicit_cross_build_test_environment(
+                environ={},
+                **valid_arguments
+            )
+        )
+        self.assertFalse(
+            run_tests._is_explicit_cross_build_test_environment(
+                environ={
+                    "PERFORMANCE_ALLOW_WIN11_CROSS_BUILD": "1",
+                    "CONDA_PREFIX": r"C:\conda",
+                },
+                **valid_arguments
+            )
+        )
+        self.assertFalse(
+            run_tests._is_explicit_cross_build_test_environment(
+                environ={"PERFORMANCE_ALLOW_WIN11_CROSS_BUILD": "1"},
+                version_info=(3, 8, 20),
+                **{
+                    key: value
+                    for key, value in valid_arguments.items()
+                    if key != "version_info"
+                }
+            )
+        )
     @unittest.skipUnless(os.name == "nt", "Windows DLL search regression")
     def test_main_bootstrap_allows_direct_env_numpy_matmul(self):
         dll_directories = native_dll_directories(sys.prefix)

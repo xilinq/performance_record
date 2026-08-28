@@ -1,31 +1,71 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""Reproducible one-file Windows build for Performance Record v1.3.0."""
+"""Win7 SP1 x64 onedir build for Performance Record v1.3.1.
 
+This spec is intentionally unusable without the audited app-local UCRT and
+VC142 roots.  tools/win7_portable.py performs the host/wheelhouse gates before
+invoking PyInstaller 5.13.2.
+"""
+
+import os
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files
-from PyQt5.QtCore import QLibraryInfo
 
 
-APP_VERSION = "1.3.0"
-APP_NAME = "PerformanceApp_v{}".format(APP_VERSION)
+PROJECT_ROOT = Path(SPECPATH).resolve()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-# Matplotlib loads style/font/data files at runtime, so keep them explicit.
+from tools.win7_portable import (  # noqa: E402
+    EXE_NAME,
+    PORTABLE_NAME,
+    spec_runtime_binaries,
+    validate_build_host,
+)
+
+
+# Defense in depth: direct `pyinstaller PerformanceApp.spec` must not bypass
+# the Windows 7 / Python.org 3.8.10 / non-Conda gate.
+validate_build_host(
+    allow_win11_cross_build=(
+        os.environ.get("PERFORMANCE_ALLOW_WIN11_CROSS_BUILD") == "1"
+    )
+)
+
+# Native imports are deliberately after the host gate.  A contaminated loader
+# must not crash inside Qt/NumPy before the build policy can explain the error.
+from PyQt5.QtCore import QLibraryInfo  # noqa: E402
+import numpy  # noqa: E402
+
 datas = collect_data_files("matplotlib")
 
-# PyInstaller's PyQt5 hook also discovers plugins. Listing qwindows.dll here
-# guarantees that the Windows platform plugin is present even if hooks change.
 qt_plugins_dir = Path(QLibraryInfo.location(QLibraryInfo.PluginsPath))
 qwindows_plugin = qt_plugins_dir / "platforms" / "qwindows.dll"
 if not qwindows_plugin.is_file():
-    raise FileNotFoundError("Qt Windows platform plugin not found: {}".format(qwindows_plugin))
+    raise FileNotFoundError(
+        "Qt Windows platform plugin not found: {}".format(qwindows_plugin)
+    )
 
-binaries = [(str(qwindows_plugin), "PyQt5/Qt5/plugins/platforms")]
+binaries = spec_runtime_binaries()
+binaries.append((str(qwindows_plugin), "PyQt5/Qt5/plugins/platforms"))
 
+# NumPy's official wheel keeps OpenBLAS beside the package in ``numpy.libs``.
+# Copy it to the application root because Win7 lacks the modern additive DLL
+# directory search used by newer Windows versions.
+numpy_package = Path(numpy.__file__).resolve().parent
+numpy_native_dirs = (numpy_package.parent / "numpy.libs", numpy_package / ".libs")
+numpy_native_dlls = []
+for native_dir in numpy_native_dirs:
+    if native_dir.is_dir():
+        numpy_native_dlls.extend(sorted(native_dir.glob("*.dll")))
+if not any("openblas" in path.name.casefold() for path in numpy_native_dlls):
+    raise FileNotFoundError("Official NumPy wheel OpenBLAS DLL was not found")
+binaries.extend((str(path), ".") for path in numpy_native_dlls)
 
 a = Analysis(
     ["main.py"],
-    pathex=["."],
+    pathex=[str(PROJECT_ROOT)],
     binaries=binaries,
     datas=datas,
     hiddenimports=["matplotlib.backends.backend_qt5agg"],
@@ -34,27 +74,33 @@ a = Analysis(
     runtime_hooks=[],
     excludes=[],
     noarchive=False,
-    optimize=0,
 )
-pyz = PYZ(a.pure)
+pyz = PYZ(a.pure, a.zipped_data)
 
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
-    name=APP_NAME,
+    exclude_binaries=True,
+    name=Path(EXE_NAME).stem,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    name=PORTABLE_NAME,
 )

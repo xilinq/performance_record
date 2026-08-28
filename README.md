@@ -1,167 +1,193 @@
 # 业绩追踪系统
 
-当前版本为 v1.3.0。这是一个基于 PyQt5、SQLite 和 Matplotlib 的 Windows 桌面应用，用于录入、维护和可视化人员分时期业绩数据。源码开发环境为 Windows 11，发布目标兼容 Windows 7 SP1 64 位。
+当前版本：**v1.3.1**。应用使用 PyQt5、SQLite 和 Matplotlib 录入、维护并可视化分时期业绩数据；SQLite 是唯一业务主库。
+
+## Win7 零安装便携版
+
+正式发布目标是 Windows 7 SP1 64 位，且系统必须已具备加载器更新 KB2533623。除此之外，目标电脑不需要安装 Python、Conda、PyQt5、Matplotlib、NumPy、VC Redistributable 或 UCRT 更新，运行时也不需要管理员权限；其余 DLL 全部随便携目录分发。
+
+这是 Python 3.8 的系统级硬要求，应用本地 DLL 无法替代 Kernel32 提供的加载器 API。若目标机没有该更新，“Python 3.8.10 且完全零系统补丁”的组合不可实现；参见 [Python 3.8 Windows 文档](https://docs.python.org/3.8/using/windows.html) 和 [Microsoft AddDllDirectory 文档](https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-adddlldirectory)。
+
+使用方法：
+
+1. 获取正式包 `PerformanceApp_v1.3.1-win7-x64-portable.zip` 及其 `.sha256` 文件；Win11 交叉构建包名称会额外包含 `win11-crossbuild-candidate`，仅供 Win7 实机测试。
+2. 完整解压整个目录到当前用户可写位置，例如 `D:\Apps\业绩追踪系统`。
+3. 运行目录内的 `PerformanceApp_v1.3.1.exe`。
+
+不要在 ZIP 内直接运行，不要只复制 EXE，也不要删除、改名或移动同目录 DLL。不要放入 `Program Files` 等普通用户不可写目录。
+
+### 启动诊断
+
+在便携目录执行：
+
+```bat
+PerformanceApp_v1.3.1.exe --diagnose
+```
+
+诊断不会打开或创建业务数据库，会逐项检测 PyQt5、Matplotlib Qt5Agg、NumPy 原生运算、`qwindows.dll` 和 SQLite。结果写入 `startup_diagnostic.log`；普通启动失败写入 `startup_error.log`。程序目录不可写时日志回退到 `%TEMP%`。
+
+冻结程序不再提示“请安装依赖”。失败提示会明确指出便携包缺失或运行库不兼容，并记录底层 DLL 错误、退出码和 traceback。若 PyInstaller bootloader 在 Python 启动前即失败，则无法生成应用日志，应重新完整解压并校验 ZIP/EXE SHA-256。
+
+`--smoke-test` 使用临时数据目录检查 NumPy、SQLite、CSV 和图表链路，不接触正式业务数据：
+
+```bat
+PerformanceApp_v1.3.1.exe --smoke-test
+```
 
 ## 数据边界
 
-- `performance.db` 是唯一业务主库，运行时查询、修改和增长率计算均以 SQLite 中已提交的数据为准。
-- CSV 只承载原始数据，用于自动镜像、手动备份和显式导入/导出；程序启动时不会从 CSV 自动同步或覆盖 SQLite。
-- CSV v3 保存姓名、时期、职级、左右区业绩、左右区订单、排序、总结和人员启停状态，不保存编号、增长率等派生值。
-- `performance_backup.csv` 是程序维护的已提交数据镜像，不应作为运行中的编辑稿。外部修改只有通过“导入 CSV”预检并确认后才会进入主库。
-- 增长率由应用根据原始业绩重新计算；SQLite 中现有增长率列仅作为内部缓存。
+- `performance.db` 是唯一业务主库；运行时查询、写入和增长率计算均以 SQLite 已提交数据为准。
+- CSV 只保存原始数据，用于自动镜像、手动备份和显式导入/导出，不参与运行时查询或业务计算。
+- `performance_backup.csv` 只镜像 SQLite 已提交状态；离线修改必须通过“导入 CSV”预检并确认后才会进入主库，启动时不会自动同步。
+- CSV v3 不保存编号、增长率等派生字段；增长率由应用重新计算。姓名库和职级库的启停状态会随原始数据一并备份。
 - `QSettings` 只保存窗口、筛选、列宽和图表显示设置，不保存业务数据。
 
-## 主要功能
+数据、备份、锁文件和启动日志均位于便携目录；源码运行时位于项目根目录。主要文件包括：
 
-- 按时期和按人员两种视图录入业绩、订单、职级及本期总结。
-- 使用年月与上/下半月选择器管理 `2020–2099` 年的时期。
-- 新增、停用和重命名人员；重命名为已有姓名时，无冲突时期可合并，同期冲突会拒绝覆盖。
-- 自动计算左区、右区和总业绩增长率，并保持原始数值精度。
-- 对业绩数字、订单整数、千分位、非有限值和 int64 越界进行原位校验。
-- 在切换时期、人员、页面、刷新或关闭前处理未保存内容。
-- 展示个人业绩趋势折线图和时期业绩对比横向柱状图。
-- 对 CSV 执行无副作用预检、摘要校验、导入前快照和原子写入。
-- 限制同一数据目录只运行一个实例，并在启动时检查目录是否可写。
-
-## 环境与启动
-
-Win7 发布基线固定为：
-
-- Windows 7 SP1 64 位，并安装 Universal CRT 相关系统更新
-- Python 3.8.20
-- PyQt5 5.15.9 / Qt 5.15.8
-- Matplotlib 3.7.3
-- NumPy 1.24.4
-- PyInstaller 6.17.0
-
-推荐直接创建锁定版本的 Conda 环境：
-
-```bat
-conda env create -f environment-win7.yml
-conda activate performance_record
-python main.py
-```
-
-已有 Python 3.8.20 环境也可按 [requirements.txt](requirements.txt) 安装依赖，但 Win7 构建和验收应优先使用 [environment-win7.yml](environment-win7.yml) 中的完整基线。
-
-## 操作说明
-
-### 数据管理
-
-1. 在“按时期”页选择年月和上/下半月，或在“按人员”页选择已有人员。
-2. 通过明确的“新增人员”入口建立姓名，再录入职级、业绩和订单。
-3. 在表格工具栏新增、删除或调整记录顺序；停用人员会显示为灰色“姓名（停用）”。
-4. 保存按钮只在存在更改时启用。切换上下文时可选择保存、放弃或取消。
-5. 保存、重载和跨视图刷新后会尽量恢复当前单元格、滚动位置和有效筛选项。
-
-常用快捷键：
-
-| 快捷键 | 功能 | 生效范围 |
-| --- | --- | --- |
-| `Ctrl+S` | 保存当前视图 | 数据管理页 |
-| `F5` | 重新加载当前视图 | 数据管理页 |
-| `Insert` | 新增记录 | 表格获得焦点且未编辑单元格时 |
-| `Ctrl+Delete` | 删除记录 | 表格获得焦点且未编辑单元格时 |
-| `Alt+↑` / `Alt+↓` | 调整排序 | 表格获得焦点且未编辑单元格时 |
-| `Ctrl+Shift+E` | 导出 CSV | 主窗口 |
-| `Ctrl+I` | 导入 CSV | 主窗口 |
-| `Ctrl+B` | 立即备份 | 主窗口 |
-
-### 图表操作
-
-- “数据标签字体”和“坐标轴字体”使用 `8–24 pt` 滑杆调整，设置会被记忆。
-- X/Y 缩放滑杆范围均为 `100%–400%`，步长 `10%`；缩放比例只在本次运行中保留。
-- 个人业绩趋势图支持 X、Y 双轴缩放；放大后按住左键可同时拖动水平和垂直显示区域。
-- 时期业绩对比图只支持 X 轴缩放；Y 轴滑杆会禁用，按住左键只能横向拖动。
-- 在图表上按 `Ctrl+滚轮` 可缩放 X 轴，并尽量保持鼠标指向的数据位置不跳动。
-- 放大后滚动条按需出现；对比图人员较多时，普通滚轮仍用于纵向浏览。
-- “重置”恢复当前图表支持的轴到 `100%`，并将显示区域移回起点。
-
-### CSV 导入、导出与备份
-
-导入流程为：选择文件 → 无副作用预检 → 查看记录数量和警告 → 确认覆盖 → 应用预检快照。预检后若文件发生变化，摘要校验会拒绝导入；导入失败不会修改当前 SQLite 数据。
-
-- 支持读取 CSV v1、v2 和 v3；旧版增长率列会被忽略并重新计算。
-- 高于当前支持版本的 CSV 会直接拒绝，避免未知字段丢失。
-- 导入前会创建不可覆盖的恢复快照；快照失败时不会修改主库。
-- SQLite 提交成功但镜像刷新失败时，程序会明确区分两种结果，不会把已提交的数据报告为未保存。
-- 导出、备份和导入前都会先处理当前未保存内容。
-
-## 数据文件位置
-
-源码运行时，数据位于项目根目录；单文件 EXE 运行时，数据位于 EXE 所在目录，不受启动工作目录影响：
-
-- `performance.db`：唯一业务主库。
-- `performance_backup.csv`：SQLite 已提交状态的自动 CSV 镜像。
-- `backup_YYYYMMDD_HHMMSS_ffffff.csv`：手动备份，文件名不会重复覆盖。
-- `backups/pre_import_YYYYMMDD_HHMMSS_ffffff_<唯一后缀>.csv`：导入前恢复快照。
-- `.performance_record.lock`：运行期单实例锁文件。
-
-因此不要把 EXE 放在 `Program Files` 等普通用户无写权限的目录；推荐放在用户拥有写权限的独立文件夹中。
-
-## 项目结构
-
-| 路径 | 作用 |
+| 文件 | 用途 |
 | --- | --- |
-| `main.py` | 应用入口、高 DPI 初始化、数据目录检查、单实例锁和冒烟测试 |
-| `database.py` | SQLite 查询、事务、增长率计算和 CSV 操作编排 |
-| `csv_codec.py` | 独立 CSV v1/v2 兼容读取、v3 写出、校验和原子替换 |
-| `runtime_bootstrap.py` | Windows/Conda 原生 DLL 搜索路径初始化 |
-| `ui/main_window.py` | 主窗口、菜单、未保存保护及设置恢复 |
-| `ui/data_entry_tab.py` | 双视图数据录入、校验、人员和时期管理 |
-| `ui/charts_tab.py` | 图表筛选、字体滑杆、双轴缩放与拖动浏览 |
-| `ui/import_preview_dialog.py` | CSV 导入预检确认对话框 |
-| `ui/rename_person_dialog.py` | 人员重命名与即时校验对话框 |
-| `ui/theme.py` | Qt5/Win7 兼容的全局浅色主题 |
-| `tests/`、`run_tests.py` | 自动化回归测试和 Windows DLL 安全的隔离测试入口 |
-| `previous_data_process.py` | 旧版分区明细 CSV 到 v3 快照的一次性转换工具 |
-| `PerformanceApp.spec` | 当前唯一有效的单文件 Windows 构建配置 |
+| `performance.db` | SQLite 主库 |
+| `performance_backup.csv` | 已提交数据的自动 CSV 镜像 |
+| `backup_*.csv` | 手动备份 |
+| `backups/pre_import_*.csv` | 导入前恢复快照 |
+| `.performance_record.lock` | 单实例锁 |
+| `settings.ini` | 便携版界面与筛选设置，不写注册表 |
 
-## 测试
+## 主要操作
 
-完整测试应在 `performance_record` 环境中运行：
+- 数据管理支持按时期、按人员两种录入视图，以及人员新增、重命名和时期管理；导入数据中的停用人员仍可安全显示历史记录。
+- 职级由职级库统一管理，默认包含“准营销经理、营销经理、高级营销经理、资深营销经理”；可在两个录入页面打开“管理职级库”新增或停用职级。历史记录中的停用职级不会丢失。
+- 姓名、职级、时期和图表筛选等所有下拉框均禁用悬停滚轮切换，需展开后点击选项，避免误操作。
+- 切换筛选、标签页、刷新或关闭前会处理未保存内容；活动单元格编辑器会先同步到表格。
+- `Ctrl+S` 保存，`F5` 重载；`Insert`、`Ctrl+Delete`、`Alt+↑/↓` 仅在表格获得焦点且未编辑时生效。
+- CSV 导入流程为：选择文件 → 无副作用预检 → 查看统计和警告 → 确认覆盖 → 原子导入。
+- 个人趋势折线图支持 X/Y 轴滑杆缩放和双向左键拖动；时期对比图只支持 X 轴缩放和横向拖动。
+- 数据标签和坐标轴字体均通过 `8–24 pt` 滑杆调整。
+
+## Win11 源码开发与测试
+
+`performance_record` Conda 环境只用于 Win11 开发和回归测试，禁止用它生成 Win7 发布包。
 
 ```bat
+conda activate performance_record
+python -m pip install -r requirements.txt
+python main.py
 run_tests.bat
+python main.py --diagnose
+python main.py --smoke-test
 ```
 
-无批处理环境时：
+也可从未激活的终端执行：
 
 ```bat
 conda run --no-capture-output -n performance_record python run_tests.py
 ```
 
-运行单个测试模块：
+不要直接调用 Conda 环境目录中的绝对 `python.exe`；这可能遗漏 `Library\bin` 并触发 `0xC06D007F`。请先激活环境或使用 `conda run`。
+
+## Win7 发布构建
+
+正式构建只能在独立 Win7 SP1 x64 虚拟机中进行，固定基线如下：
+
+- Python.org CPython 3.8.10 x64
+- PyQt5 5.15.9、PyQt5-Qt5 5.15.2、PyQt5-sip 12.12.2
+- Matplotlib 3.7.3、NumPy 1.24.4
+- PyInstaller 5.13.2、pyinstaller-hooks-contrib 2023.8
+- Windows 7 SP1 已安装 KB2533623
+- Windows SDK 10.0.14393 `ucrt\DLLs\x64` 完整应用本地 UCRT 目录
+- VC142 14.29.30153 包中的 x64 应用本地运行库（DLL `FileVersion` 为 `14.29.30157.0`）
+
+### 1. 准备离线 wheelhouse
+
+在联网准备机上使用空目录：
 
 ```bat
-run_tests.bat tests/test_charts_ui.py
+python tools\win7_portable.py prepare-wheelhouse ^
+  --wheelhouse D:\release-inputs\wheelhouse ^
+  --requirements requirements-win7-build.txt
 ```
 
-源码冒烟测试会使用临时数据目录，并覆盖 NumPy 原生运算、SQLite、CSV 和图表启动链路：
+该命令只下载 CPython 3.8 `win_amd64` 二进制 wheel，校验传递依赖闭包，并根据真实 wheel 字节生成：
+
+- `wheelhouse-manifest.json`
+- `requirements-win7-resolved.txt`（包含每个 wheel 的 SHA-256）
+
+把项目、完整 wheelhouse、SDK UCRT 目录和 VC Runtime 目录离线复制到构建虚拟机。不要手工修改锁或混入其他 wheel。
+
+### 2. 在 Win7 构建虚拟机打包
 
 ```bat
-conda run --no-capture-output -n performance_record python main.py --smoke-test
-```
-
-不要通过绝对路径直接调用 Conda 环境中的 `python.exe` 运行 NumPy、Qt 或 Matplotlib 测试。该方式不会完整注入 `Library\bin`，可能触发 Windows 异常 `0xC06D007F`；请使用上面的批处理或 `conda run` 入口。
-
-## 构建与验收
-
-```bat
+set WIN7_WHEELHOUSE=D:\release-inputs\wheelhouse
+set WIN7_UCRT_ROOT=D:\release-inputs\ucrt-10.0.14393-x64
+set WIN7_VC_RUNTIME_ROOT=D:\release-inputs\vc142-14.29-x64
 pyinstall.bat
-dist\PerformanceApp_v1.3.0.exe --smoke-test
 ```
 
-[PerformanceApp.spec](PerformanceApp.spec) 是唯一维护的构建配置：单文件、无控制台、关闭 UPX，并显式收集 Matplotlib 数据和 Qt Windows 平台插件。
+构建入口会强制检查 Win7 SP1 x64、KB2533623、Python.org 3.8.10、非 Conda、离线哈希锁、运行库版本和完整性；随后创建隔离 venv、运行全量测试、执行 onedir 构建、检查 PE 依赖闭包和污染 DLL，并对成品运行 `--diagnose`/`--smoke-test` 后再生成候选清单及哈希。
 
-正式 Win7 发布包应在安装了 Universal CRT 更新的干净 Win7 SP1 x64 虚拟机中构建并验收，同时在 Win7/Win11、`1024×768` 与 `1920×1080`、100%/125%/150% 缩放下检查首次启动、中文路径、增删改查、图表、CSV、备份和重启恢复。
+构建阶段只输出候选包，不生成正式同名 ZIP：
 
-## 常见问题
+```text
+dist\PerformanceApp_v1.3.1-win7-x64-portable\
+dist\PerformanceApp_v1.3.1-win7-x64-portable-candidate.zip
+dist\PerformanceApp_v1.3.1-win7-x64-portable-candidate.zip.sha256
+dist\PerformanceApp_v1.3.1.exe.sha256
+dist\WIN7_ACCEPTANCE_v1.3.1.json
+```
 
-- 出现 `0xC06D007F`：使用 `run_tests.bat`、`pyinstall.bat` 或 `conda run`，不要直接启动环境目录下的 `python.exe`；重新构建时只使用当前 `PerformanceApp.spec`。
-- 提示数据目录不可写：将整个 EXE 和数据文件移动到当前用户可写目录。
-- 提示程序已在运行：关闭使用同一数据目录的现有实例后再启动。
-- CSV 预检失败：根据对话框中的版本、时期、数字、排序或缺失数据段提示修正源文件；失败不会修改主库。
-- 提示 SQLite 已提交但镜像失败：主库修改已经成功，应修复目录权限或文件占用后再执行备份。
+便携目录内的 `PORTABLE_MANIFEST.json` 记录依赖版本、构建系统、运行库来源摘要、PE 审计和文件清单；`SHA256SUMS.txt` 记录目录内文件哈希。`PerformanceApp.spec` 是唯一有效构建配置，采用 onedir/`COLLECT`、关闭 UPX，并显式收集 Matplotlib、Qt 平台插件和应用本地运行库。
+
+构建工具会拒绝 Conda DLL、错误版本的 UCRT/VC Runtime、ICU 75、MKL 2025 以及未解析的非系统 DLL。Win7 版本只发布 onedir 便携 ZIP，不发布单文件 EXE。
+
+### Win11 交叉构建候选包
+
+如需先在当前 Win11 主机生成供 Win7 实机排障的 ZIP，可在官方 Python 3.8.10、锁定 wheelhouse、SDK 14393.795 UCRT 和 VC142 14.29 输入齐全时，为 `build` 增加 `--allow-win11-cross-build`。该模式仍执行全量测试、PE/DLL 审计和成品冒烟，但输出会明确命名为：
+
+```text
+dist\PerformanceApp_v1.3.1-win7-x64-portable-win11-crossbuild-candidate.zip
+```
+
+其 manifest 状态为 `experimental_win11_cross_build_requires_win7_runtime_test`，不能执行 `finalize`，也不能标记为正式 Win7 发布包。复制到 Win7 后必须完整解压，先运行 `--diagnose` 和 `--smoke-test`，再启动界面。
+
+### 3. 发布验收
+
+候选 ZIP 必须在仅具备 Win7 SP1 与 KB2533623、但无 Python、Conda、VC Redistributable 和 UCRT 更新的干净 Win7 x64 虚拟机中，以普通用户、离线状态、中文可写路径完整解压并验收：
+
+- `--diagnose` 和 `--smoke-test` 返回 0，且诊断前后不生成 `performance.db`。
+- 首次启动、增删改查、图表缩放、CSV 导入导出、备份、单实例和重启恢复正常。
+- 同一候选 ZIP 在 Win11 完成回归。
+- ZIP/EXE SHA-256 与随包文件一致。
+
+验收完成后填写 `dist\WIN7_ACCEPTANCE_v1.3.1.json` 中的测试人、时间及全部确认项，再回到同一 Win7 构建虚拟机执行：
+
+```bat
+py -3.8-64 tools\win7_portable.py finalize ^
+  --project-root "%CD%" ^
+  --acceptance-record dist\WIN7_ACCEPTANCE_v1.3.1.json
+```
+
+`finalize` 会校验验收记录与候选 manifest 摘要、确认候选目录没有增加或修改任何文件，再把 manifest 标记为已验收，并生成正式文件：
+
+```text
+dist\PerformanceApp_v1.3.1-win7-x64-portable.zip
+dist\PerformanceApp_v1.3.1-win7-x64-portable.zip.sha256
+```
+
+缺少任一 Win7/Win11 验收项时不会生成正式 ZIP。
+
+## 项目结构
+
+| 路径 | 作用 |
+| --- | --- |
+| `main.py` | 启动、运行时探测、日志、数据目录、单实例和冒烟测试 |
+| `runtime_bootstrap.py` | 源码/冻结模式原生 DLL 搜索路径引导 |
+| `database.py` | SQLite Repository、事务和数据服务 |
+| `csv_codec.py` | CSV v1/v2 兼容读取、v3 写出、校验和原子替换 |
+| `ui/` | 数据录入、图表、姓名/职级管理对话框和 Qt5/Win7 主题 |
+| `tests/`、`run_tests.py` | 隔离回归测试入口 |
+| `requirements.txt` | Win11 源码开发依赖 |
+| `requirements-win7-build.txt` | Win7 发布构建固定依赖 |
+| `tools/win7_portable.py` | wheelhouse、构建、PE 审计、清单、哈希和 ZIP 工具 |
+| `PerformanceApp.spec` | v1.3.1 Win7 onedir 构建配置 |
 
 版本变化见 [CHANGELOG.md](CHANGELOG.md)。

@@ -38,8 +38,10 @@ from PyQt5.QtWidgets import (
 )
 
 try:
+    from .position_library_dialog import PositionLibraryDialog
     from .rename_person_dialog import RenamePersonDialog
 except ImportError:  # 支持直接运行本文件
+    from position_library_dialog import PositionLibraryDialog
     from rename_person_dialog import RenamePersonDialog
 
 
@@ -365,13 +367,14 @@ class DataEntryTab(QWidget):
     def _layout_period_toolbar(self, compact):
         while self.period_toolbar.count():
             self.period_toolbar.takeAt(0)
-        for column in range(9):
+        for column in range(11):
             self.period_toolbar.setColumnStretch(column, 0)
         name_widgets = (
             self.name_library_label,
             self.new_person_input,
             self.add_person_button,
             self.rename_person_button,
+            self.manage_positions_button,
         )
         record_widgets = (
             self.add_row_button,
@@ -381,13 +384,16 @@ class DataEntryTab(QWidget):
         )
         for column, widget in enumerate(name_widgets):
             self.period_toolbar.addWidget(widget, 0, column)
+        spacer_column = len(name_widgets)
         if compact:
             for column, widget in enumerate(record_widgets):
                 self.period_toolbar.addWidget(widget, 1, column)
-            self.period_toolbar.setColumnStretch(4, 1)
+            self.period_toolbar.setColumnStretch(spacer_column, 1)
         else:
-            self.period_toolbar.setColumnStretch(4, 1)
-            for offset, widget in enumerate(record_widgets, start=5):
+            self.period_toolbar.setColumnStretch(spacer_column, 1)
+            for offset, widget in enumerate(
+                record_widgets, start=spacer_column + 1
+            ):
                 self.period_toolbar.addWidget(widget, 0, offset)
 
     def _set_summary_expanded(self, expanded, persist=False):
@@ -459,6 +465,10 @@ class DataEntryTab(QWidget):
         self.add_person_button.clicked.connect(self.add_new_person)
         self.rename_person_button = self._set_button_role(QPushButton("重命名"), "secondary")
         self.rename_person_button.clicked.connect(self.open_rename_dialog)
+        self.manage_positions_button = self._set_button_role(
+            QPushButton("管理职级库"), "secondary"
+        )
+        self.manage_positions_button.clicked.connect(self.open_position_library)
         self.add_row_button = self._set_button_role(QPushButton("新增记录"), "secondary")
         self.add_row_button.clicked.connect(self.add_row)
         self.move_up_button = self._set_button_role(QPushButton("上移"), "secondary")
@@ -550,6 +560,13 @@ class DataEntryTab(QWidget):
         layout.addWidget(selector_card)
 
         toolbar = QHBoxLayout()
+        self.manage_positions_from_person_button = self._set_button_role(
+            QPushButton("管理职级库"), "secondary"
+        )
+        self.manage_positions_from_person_button.clicked.connect(
+            self.open_position_library
+        )
+        toolbar.addWidget(self.manage_positions_from_person_button)
         self.add_person_period_button = self._set_button_role(QPushButton("新增时期"), "secondary")
         self.add_person_period_button.clicked.connect(self.add_person_period)
         toolbar.addWidget(self.add_person_period_button)
@@ -1014,6 +1031,102 @@ class DataEntryTab(QWidget):
         combo.currentTextChanged.connect(self._mark_period_dirty)
         return combo
 
+    def _populate_position_combo(self, combo, current_position=""):
+        blocker = QSignalBlocker(combo)
+        combo.clear()
+        combo.addItem("", "")
+        active_positions = [
+            position
+            for position in self.db.get_all_positions(active_only=True)
+            if position
+        ]
+        for position in active_positions:
+            combo.addItem(position, position)
+        if current_position and current_position not in active_positions:
+            combo.addItem(f"{current_position}（停用）", current_position)
+            index = combo.count() - 1
+            combo.setItemData(index, QColor("#6B7280"), Qt.ForegroundRole)
+            combo.setItemData(
+                index, "该职级已停用，但历史记录仍保留", Qt.ToolTipRole
+            )
+        index = combo.findData(current_position, Qt.UserRole)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        del blocker
+
+    @staticmethod
+    def _combo_position_key(combo):
+        if not isinstance(combo, QComboBox) or combo.currentIndex() < 0:
+            return ""
+        value = combo.currentData(Qt.UserRole)
+        if value is None:
+            value = combo.currentText()
+        return str(value or "").strip()
+
+    def _sync_position_cell(self, table, column, combo, dirty_callback):
+        index = table.indexAt(
+            combo.mapTo(table.viewport(), combo.rect().center())
+        )
+        row = index.row()
+        if row < 0 or row >= table.rowCount():
+            return
+        position = self._combo_position_key(combo)
+        item = table.item(row, column)
+        if item is None:
+            item = QTableWidgetItem()
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            table.setItem(row, column, item)
+        blocker = QSignalBlocker(table)
+        item.setText(position)
+        item.setToolTip(position)
+        del blocker
+        if not self._loading:
+            dirty_callback()
+
+    def _set_position_cell(
+        self, table, row, column, current_position, dirty_callback
+    ):
+        position = str(current_position or "").strip()
+        item = QTableWidgetItem(position)
+        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        item.setToolTip(position)
+        table.setItem(row, column, item)
+        combo = QComboBox()
+        combo.setObjectName("recordPositionCombo")
+        self._populate_position_combo(combo, position)
+        combo.activated[int].connect(
+            lambda _index, target=table, target_column=column,
+            target_combo=combo, callback=dirty_callback:
+            self._sync_position_cell(
+                target, target_column, target_combo, callback
+            )
+        )
+        table.setCellWidget(row, column, combo)
+        return combo
+
+    @staticmethod
+    def _position_value(table, row, column):
+        item = table.item(row, column)
+        if item is not None:
+            return item.text().strip()
+        return DataEntryTab._combo_position_key(table.cellWidget(row, column))
+
+    def refresh_position_combos(self):
+        """Refresh both tables while preserving active and historical values."""
+        for table, column in ((self.table, 0), (self.person_table, 1)):
+            for row in range(table.rowCount()):
+                position = self._position_value(table, row, column)
+                combo = table.cellWidget(row, column)
+                if not isinstance(combo, QComboBox):
+                    continue
+                self._populate_position_combo(combo, position)
+
+    def open_position_library(self):
+        dialog = PositionLibraryDialog(self.db, self)
+        dialog.exec_()
+        if dialog.changed:
+            self.refresh_position_combos()
+            self.statusMessage.emit("职级库已更新", 4000)
+
     @staticmethod
     def _capture_table_state(table, key_for_row):
         row = table.currentRow()
@@ -1067,7 +1180,9 @@ class DataEntryTab(QWidget):
                 row = self.table.rowCount()
                 self.table.insertRow(row)
                 position = row_data[8] if len(row_data) >= 9 and row_data[8] else ""
-                self.table.setItem(row, 0, QTableWidgetItem(str(position)))
+                self._set_position_cell(
+                    self.table, row, 0, position, self._mark_period_dirty
+                )
                 self.table.setCellWidget(row, 1, self._name_combo(str(row_data[0])))
                 self.table.setItem(row, 2, self._numeric_item(row_data[1]))
                 self.table.setItem(row, 3, self._numeric_item(row_data[3], True))
@@ -1089,7 +1204,9 @@ class DataEntryTab(QWidget):
     def add_row(self, checked=False, mark_dirty=True):
         row = self.table.rowCount()
         self.table.insertRow(row)
-        self.table.setItem(row, 0, QTableWidgetItem(""))
+        self._set_position_cell(
+            self.table, row, 0, "", self._mark_period_dirty
+        )
         self.table.setCellWidget(row, 1, self._name_combo())
         self.table.setItem(row, 2, self._numeric_item(None))
         self.table.setItem(row, 3, self._numeric_item(None, True))
@@ -1316,10 +1433,11 @@ class DataEntryTab(QWidget):
                         QMessageBox.warning(self, "数据错误", f"第 {row + 1} 行姓名不能为空。")
                         return False
                     continue
-                position_item = self.table.item(row, 0)
                 records.append({
                     "name": name,
-                    "position": position_item.text().strip() if position_item else "",
+                    "position": DataEntryTab._position_value(
+                        self.table, row, 0
+                    ),
                     "sort_order": row,
                     "left_perf": self._read_number(self.table, row, 2, float),
                     "left_orders": self._read_number(self.table, row, 3, int),
@@ -1385,20 +1503,34 @@ class DataEntryTab(QWidget):
     def swap_table_rows(self, first, second):
         self._loading = True
         try:
-            for column in range(self.table.columnCount()):
-                if column == 1:
-                    first_combo = self.table.cellWidget(first, column)
-                    second_combo = self.table.cellWidget(second, column)
-                    first_text, second_text = first_combo.currentText(), second_combo.currentText()
-                    first_blocker, second_blocker = QSignalBlocker(first_combo), QSignalBlocker(second_combo)
-                    first_combo.setCurrentText(second_text)
-                    second_combo.setCurrentText(first_text)
-                    del first_blocker, second_blocker
-                else:
-                    first_item = self.table.takeItem(first, column)
-                    second_item = self.table.takeItem(second, column)
-                    self.table.setItem(first, column, second_item)
-                    self.table.setItem(second, column, first_item)
+            first_position = self._position_value(self.table, first, 0)
+            second_position = self._position_value(self.table, second, 0)
+            first_position_combo = self.table.cellWidget(first, 0)
+            second_position_combo = self.table.cellWidget(second, 0)
+            self._populate_position_combo(first_position_combo, second_position)
+            self._populate_position_combo(second_position_combo, first_position)
+            self.table.item(first, 0).setText(second_position)
+            self.table.item(second, 0).setText(first_position)
+
+            first_name_combo = self.table.cellWidget(first, 1)
+            second_name_combo = self.table.cellWidget(second, 1)
+            first_name = self._combo_person_key(first_name_combo)
+            second_name = self._combo_person_key(second_name_combo)
+            first_blocker = QSignalBlocker(first_name_combo)
+            second_blocker = QSignalBlocker(second_name_combo)
+            first_name_combo.setCurrentIndex(
+                first_name_combo.findData(second_name, Qt.UserRole)
+            )
+            second_name_combo.setCurrentIndex(
+                second_name_combo.findData(first_name, Qt.UserRole)
+            )
+            del first_blocker, second_blocker
+
+            for column in range(2, self.table.columnCount()):
+                first_item = self.table.takeItem(first, column)
+                second_item = self.table.takeItem(second, column)
+                self.table.setItem(first, column, second_item)
+                self.table.setItem(second, column, first_item)
         finally:
             self._loading = False
         self._set_period_dirty(True)
@@ -1449,7 +1581,9 @@ class DataEntryTab(QWidget):
             period_item = QTableWidgetItem(period or "")
             period_item.setFlags(period_item.flags() & ~Qt.ItemIsEditable)
             self.person_table.setItem(row, 0, period_item)
-            self.person_table.setItem(row, 1, QTableWidgetItem(""))
+            self._set_position_cell(
+                self.person_table, row, 1, "", self._mark_person_dirty
+            )
             self.person_table.setItem(row, 2, self._numeric_item(None))
             self.person_table.setItem(row, 3, self._numeric_item(None, True))
             self.person_table.setItem(row, 4, self._numeric_item(None))
@@ -1465,7 +1599,9 @@ class DataEntryTab(QWidget):
             period_item.setData(Qt.UserRole + 1, row_data[9])
         self.person_table.setItem(row, 0, period_item)
         position = row_data[8] if len(row_data) >= 9 and row_data[8] else ""
-        self.person_table.setItem(row, 1, QTableWidgetItem(str(position)))
+        self._set_position_cell(
+            self.person_table, row, 1, position, self._mark_person_dirty
+        )
         self.person_table.setItem(row, 2, self._numeric_item(row_data[1]))
         self.person_table.setItem(row, 3, self._numeric_item(row_data[3], True))
         self.person_table.setItem(row, 4, self._numeric_item(row_data[2]))
@@ -1552,9 +1688,9 @@ class DataEntryTab(QWidget):
         row = self._insert_person_row(period=period)
         self.person_table.setCurrentCell(row, 1)
         self._set_person_dirty(True)
-        position_item = self.person_table.item(row, 1)
-        if position_item:
-            self.person_table.editItem(position_item)
+        position_combo = self.person_table.cellWidget(row, 1)
+        if position_combo:
+            position_combo.setFocus(Qt.ShortcutFocusReason)
 
     def edit_person_period(self):
         row = self.person_table.currentRow()
@@ -1632,7 +1768,6 @@ class DataEntryTab(QWidget):
                         QMessageBox.warning(self, "数据错误", f"第 {row + 1} 行时期不能为空。")
                         return False
                     continue
-                position_item = self.person_table.item(row, 1)
                 original_period = period_item.data(Qt.UserRole)
                 original_sort_order = period_item.data(Qt.UserRole + 1)
                 original_display = (
@@ -1646,7 +1781,9 @@ class DataEntryTab(QWidget):
                     "period": period,
                     "original_period": original_period,
                     "sort_order": original_sort_order,
-                    "position": position_item.text().strip() if position_item else "",
+                    "position": DataEntryTab._position_value(
+                        self.person_table, row, 1
+                    ),
                     "left_perf": DataEntryTab._read_number(self.person_table, row, 2, float),
                     "left_orders": DataEntryTab._read_number(self.person_table, row, 3, int),
                     "right_perf": DataEntryTab._read_number(self.person_table, row, 4, float),

@@ -1,7 +1,8 @@
-# Performance Record v1.3.0 runtime and packaging baseline.
-# Python 3.8.20 and Qt 5.15.8 are pinned in environment-win7.yml.
+# Win11 source-development and regression-test dependencies.
+# Do not use this file to build the Win7 release package.  The release build
+# uses Python.org CPython 3.8.10 and requirements-win7-build.txt through the
+# hashed offline wheelhouse workflow documented in README.md.
 
 PyQt5==5.15.9
 matplotlib==3.7.3
 numpy==1.24.4
-PyInstaller==6.17.0

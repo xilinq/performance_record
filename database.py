@@ -16,6 +16,7 @@ from csv_codec import (
     PERIOD_PATTERN as CANONICAL_PERIOD_PATTERN,
     CsvCodec,
     CsvNameRecord,
+    CsvPositionRecord,
     CsvPerformanceRecord,
     CsvSnapshot,
     CsvSummaryRecord,
@@ -23,7 +24,20 @@ from csv_codec import (
     normalize_period,
 )
 
-__all__ = ["DatabaseManager", "MutationResult", "ImportPlan"]
+__all__ = [
+    "DatabaseManager",
+    "MutationResult",
+    "ImportPlan",
+    "DEFAULT_POSITIONS",
+]
+
+
+DEFAULT_POSITIONS = (
+    "准营销经理",
+    "营销经理",
+    "高级营销经理",
+    "资深营销经理",
+)
 
 
 @dataclass(frozen=True)
@@ -120,6 +134,15 @@ class DatabaseManager:
                 )
                 """
             )
+            self.cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS all_positions (
+                    position TEXT PRIMARY KEY,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_active INTEGER DEFAULT 1
+                )
+                """
+            )
 
             self.cursor.execute("PRAGMA table_info(performance)")
             columns = {row[1] for row in self.cursor.fetchall()}
@@ -139,6 +162,7 @@ class DatabaseManager:
                     )
 
         self.initialize_all_names()
+        self.initialize_all_positions()
         with self.conn:
             self._normalize_sort_orders_no_commit()
         # The automatic CSV is an app-owned mirror, so refresh it on every
@@ -221,6 +245,93 @@ class DatabaseManager:
         with self.conn:
             self._ensure_name_no_commit(name, reactivate=True)
         return self._finish_mutation(affected_rows=1)
+
+    @staticmethod
+    def _clean_position(position):
+        cleaned = str(position).strip() if position is not None else ""
+        if not cleaned:
+            raise ValueError("职级不能为空")
+        return cleaned
+
+    def _ensure_position_no_commit(self, position, reactivate=False):
+        position = self._clean_position(position)
+        self.cursor.execute(
+            "INSERT OR IGNORE INTO all_positions (position, is_active) "
+            "VALUES (?, 1)",
+            (position,),
+        )
+        if reactivate:
+            self.cursor.execute(
+                "UPDATE all_positions SET is_active = 1 WHERE position = ?",
+                (position,),
+            )
+        return position
+
+    def initialize_all_positions(self):
+        """补齐默认职级及历史记录中的职级，不改变已有启停状态。"""
+        self.cursor.execute(
+            "SELECT DISTINCT position FROM performance "
+            "WHERE position IS NOT NULL AND TRIM(position) != ''"
+        )
+        used_positions = [row[0].strip() for row in self.cursor.fetchall()]
+        with self.conn:
+            self.cursor.executemany(
+                "INSERT OR IGNORE INTO all_positions (position, is_active) "
+                "VALUES (?, 1)",
+                [(position,) for position in DEFAULT_POSITIONS + tuple(used_positions)],
+            )
+        return len(used_positions)
+
+    def add_position(self, position):
+        """添加或重新启用职级。"""
+        try:
+            with self.conn:
+                self._ensure_position_no_commit(position, reactivate=True)
+            self.last_error = ""
+            return self._finish_mutation(affected_rows=1)
+        except Exception as exc:
+            self.last_error = str(exc)
+            return MutationResult(committed=False, error=str(exc))
+
+    def get_all_positions(self, active_only=True):
+        """获取职级库；空白项用于兼容没有职级的历史记录。"""
+        order_sql = (
+            "CASE position "
+            + " ".join(
+                f"WHEN ? THEN {index}" for index, _ in enumerate(DEFAULT_POSITIONS)
+            )
+            + f" ELSE {len(DEFAULT_POSITIONS)} END, position"
+        )
+        sql = "SELECT position FROM all_positions"
+        if active_only:
+            sql += " WHERE is_active = 1"
+        sql += " ORDER BY " + order_sql
+        self.cursor.execute(sql, DEFAULT_POSITIONS)
+        return [""] + [row[0] for row in self.cursor.fetchall()]
+
+    def deactivate_position(self, position):
+        try:
+            cleaned = self._clean_position(position)
+            with self.conn:
+                self.cursor.execute(
+                    "UPDATE all_positions SET is_active = 0 WHERE position = ?",
+                    (cleaned,),
+                )
+                affected_rows = self.cursor.rowcount
+            self.last_error = ""
+            return self._finish_mutation(
+                affected_rows=affected_rows, run_mirror=bool(affected_rows)
+            )
+        except Exception as exc:
+            self.last_error = str(exc)
+            return MutationResult(committed=False, error=str(exc))
+
+    def get_position_usage_count(self, position):
+        cleaned = self._clean_position(position)
+        self.cursor.execute(
+            "SELECT COUNT(*) FROM performance WHERE position = ?", (cleaned,)
+        )
+        return int(self.cursor.fetchone()[0])
 
     @classmethod
     def normalize_period(cls, period):
@@ -421,6 +532,10 @@ class DatabaseManager:
         self.cursor.execute("DELETE FROM performance WHERE period = ?", (period,))
         for record in records:
             self._ensure_name_no_commit(record["name"], reactivate=True)
+            if record["position"]:
+                self._ensure_position_no_commit(
+                    record["position"], reactivate=False
+                )
             self.cursor.execute(
                 """
                 INSERT INTO performance
@@ -511,6 +626,11 @@ class DatabaseManager:
 
         with self.conn:
             self._ensure_name_no_commit(name, reactivate=True)
+            for record in normalized:
+                if record["position"]:
+                    self._ensure_position_no_commit(
+                        record["position"], reactivate=False
+                    )
 
             self.cursor.executemany(
                 "DELETE FROM performance WHERE name = ? AND period = ?",
@@ -881,10 +1001,19 @@ class DatabaseManager:
                 )
                 for row in self.cursor.fetchall()
             )
+            self.cursor.execute(
+                "SELECT position, is_active FROM all_positions "
+                "ORDER BY position"
+            )
+            positions = tuple(
+                CsvPositionRecord(position=row[0], is_active=row[1])
+                for row in self.cursor.fetchall()
+            )
             return CsvSnapshot(
                 performance=performance,
                 summaries=summaries,
                 names=names,
+                positions=positions,
             )
         finally:
             if started_transaction and self.conn.in_transaction:
@@ -954,6 +1083,7 @@ class DatabaseManager:
                 self.cursor.execute("DELETE FROM performance")
                 self.cursor.execute("DELETE FROM summaries")
                 self.cursor.execute("DELETE FROM all_names")
+                self.cursor.execute("DELETE FROM all_positions")
 
                 self.cursor.executemany(
                     """
@@ -996,6 +1126,30 @@ class DatabaseManager:
                             "INSERT INTO all_names (name, is_active) VALUES (?, ?)",
                             (person.name, person.is_active),
                         )
+                self.cursor.executemany(
+                    "INSERT INTO all_positions (position, is_active) VALUES (?, ?)",
+                    [
+                        (position.position, position.is_active)
+                        for position in snapshot.positions
+                    ],
+                )
+                # Old compatible CSV files do not have a registry section.
+                # Always add missing defaults and historical values, while
+                # INSERT OR IGNORE preserves explicit inactive states.
+                self.cursor.executemany(
+                    "INSERT OR IGNORE INTO all_positions (position, is_active) "
+                    "VALUES (?, 1)",
+                    [(position,) for position in DEFAULT_POSITIONS],
+                )
+                self.cursor.executemany(
+                    "INSERT OR IGNORE INTO all_positions (position, is_active) "
+                    "VALUES (?, 1)",
+                    [
+                        (record.position,)
+                        for record in snapshot.performance
+                        if record.position
+                    ],
+                )
                 self._normalize_sort_orders_no_commit()
                 self._recalculate_all_growth_rates_no_commit()
         except Exception as exc:
@@ -1011,7 +1165,8 @@ class DatabaseManager:
             "导入完成: "
             f"{plan.performance_count}条业绩记录, "
             f"{plan.summary_count}条总结记录, "
-            f"{plan.name_count}条名册记录"
+            f"{plan.name_count}条名册记录, "
+            f"{plan.position_count}条职级记录"
         )
         return self._finish_mutation(
             affected_rows=plan.performance_count,

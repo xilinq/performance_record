@@ -1,6 +1,28 @@
 # 业绩追踪系统更新日志
 
-## 未发布
+## v1.3.1（2026-08-28）
+
+### 职级库与下拉操作
+
+- 新增 SQLite 职级库和职级管理窗口，内置“准营销经理、营销经理、高级营销经理、资深营销经理”。
+- 支持新增、停用职级并保留历史记录；按时期、按人员两张录入表均改用职级下拉框。
+- 所有下拉框禁用悬停滚轮切换，防止姓名、职级、时期和图表筛选被误改。
+- CSV v3 增加兼容的职级库数据段，保存自定义职级及启停状态；旧 v1/v2/v3 文件仍可导入并自动重建职级库。
+
+### Win7 零安装便携版
+
+- 修正“请安装 PyQt5/Matplotlib”的误导诊断；按组件探测 PyQt5、Qt5Agg、NumPy 原生运算、qwindows 和 SQLite，并记录完整异常链。
+- 冻结程序及 `--diagnose` 使用隔离子进程探测原生组件，可捕获 `0xC06D007F` 退出码并避免阻塞式 Windows 错误窗口。
+- 新增 `startup_error.log`、`startup_diagnostic.log` 及 `%TEMP%` 回退；`--diagnose` 不打开业务数据库。
+- 冻结版界面设置保存到便携目录 `settings.ini`，不再写入 Windows 注册表。
+- 发布方式由单文件改为 Win7 onedir 便携目录，应用本地携带 UCRT 10.0.14393 和 VC142 14.29 运行库。
+- Win7 发布固定为 Python.org 3.8.10、PyInstaller 5.13.2 和哈希锁定的离线二进制 wheel；禁止使用 Conda 构建。
+- 明确 Python 3.8 的 Win7 硬下限：系统须已有 KB2533623；UCRT 与 VC Runtime 仍由便携目录提供。
+- 新增构建主机、DLL 版本、污染依赖、PE 闭包、文件清单和 SHA-256 门禁；只有 Win7 SP1 x64 + KB2533623 基线验收通过后才能发布。
+- 构建阶段只生成带 `-candidate` 后缀的候选 ZIP；正式 ZIP 必须通过绑定 manifest 摘要的 Win7/Win11 验收记录执行 `finalize` 后生成。
+- 新增显式 Win11 交叉构建模式，只生成不可 `finalize` 的 Win7 实机测试候选 ZIP。
+- 将官方 SDK 1607 UCRT 基线修正为实际的 `10.0.14393.795`，并排除未使用且依赖 WinRT 的 VC DLL。
+- 统一根目录 VC14.29 运行库，替换 PyQt5/Matplotlib wheel 内的旧私有副本；修复构建来源审计误判。
 
 ### 图表交互
 

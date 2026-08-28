@@ -75,9 +75,13 @@ class ImportPreviewDialog(QDialog):
         self.name_count_label = QLabel(
             f"姓名名册  {int(self._plan_value('name_count', 0) or 0)} 人"
         )
+        self.position_count_label = QLabel(
+            f"职级库  {int(self._plan_value('position_count', 0) or 0)} 项"
+        )
         counts.addWidget(self.performance_count_label)
         counts.addWidget(self.summary_count_label)
         counts.addWidget(self.name_count_label)
+        counts.addWidget(self.position_count_label)
         counts.addStretch(1)
         form.addRow("统计：", counts)
         layout.addWidget(details)

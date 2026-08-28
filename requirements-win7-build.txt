@@ -1,0 +1,31 @@
+# Offline Win7 x64 build inputs.  Do not install these from the network on the
+# build VM.  First create a hashed wheelhouse with tools/win7_portable.py.
+#
+# Python build interpreter: Python.org CPython 3.8.10 x64
+
+pip==23.2.1
+setuptools==68.2.2
+
+PyQt5==5.15.9
+PyQt5-Qt5==5.15.2
+PyQt5-sip==12.12.2
+matplotlib==3.7.3
+numpy==1.24.4
+
+PyInstaller==5.13.2
+pyinstaller-hooks-contrib==2023.8
+altgraph==0.17.4
+pefile==2023.2.7
+pywin32-ctypes==0.2.2
+
+contourpy==1.1.1
+cycler==0.12.1
+fonttools==4.42.1
+importlib-resources==6.1.0
+kiwisolver==1.4.5
+packaging==23.1
+Pillow==10.0.1
+pyparsing==3.1.1
+python-dateutil==2.8.2
+six==1.16.0
+zipp==3.17.0

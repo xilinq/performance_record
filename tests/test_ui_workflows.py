@@ -82,6 +82,44 @@ class DataEntryWorkflowTests(unittest.TestCase):
         self.tab.load_period_data()
         self.assertFalse(self.tab.save_button.isEnabled())
 
+    def test_position_cells_are_registry_backed_combo_boxes(self):
+        combo = self.tab.table.cellWidget(0, 0)
+        self.assertIsNotNone(combo)
+        for position in (
+            "准营销经理",
+            "营销经理",
+            "高级营销经理",
+            "资深营销经理",
+        ):
+            self.assertGreaterEqual(combo.findData(position, Qt.UserRole), 0)
+
+        index = combo.findData("高级营销经理", Qt.UserRole)
+        combo.setCurrentIndex(index)
+        combo.activated[int].emit(index)
+        name_combo = self.tab.table.cellWidget(0, 1)
+        name_combo.setCurrentText("alice")
+        self.assertTrue(self.tab.save_data())
+        self.assertEqual(
+            self.db.get_data_by_period(self.tab.get_current_period())[0][8],
+            "高级营销经理",
+        )
+
+    def test_inactive_historical_position_keeps_stable_raw_value(self):
+        period = self.tab.get_current_period()
+        self.db.add_position("区域总监")
+        self.db.save_period_data(
+            period,
+            [{"name": "alice", "position": "区域总监", "left_perf": 1}],
+        )
+        self.db.deactivate_position("区域总监")
+        self.tab.load_period_data()
+
+        combo = self.tab.table.cellWidget(0, 0)
+        index = combo.findData("区域总监", Qt.UserRole)
+        self.assertGreaterEqual(index, 0)
+        self.assertEqual(combo.itemText(index), "区域总监（停用）")
+        self.assertEqual(self.tab._position_value(self.tab.table, 0, 0), "区域总监")
+
     def test_period_picker_uses_explicit_chinese_half_month_and_buttons(self):
         dialog = PeriodPickerDialog(initial_period="2026-03-下")
         try:

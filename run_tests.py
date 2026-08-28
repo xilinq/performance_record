@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -63,11 +64,73 @@ def _normalize_module(value):
     return normalized.strip("./").replace("/", ".")
 
 
+def _is_win7_release_test_environment(
+    environ=None,
+    platform_name=None,
+    version_info=None,
+    windows_version=None,
+    machine=None,
+    max_size=None,
+):
+    """Return whether this is the fixed, non-Conda Win7 release environment."""
+
+    environment = os.environ if environ is None else environ
+    if environment.get("CONDA_PREFIX") or environment.get("CONDA_DEFAULT_ENV"):
+        return False
+    current_platform = sys.platform if platform_name is None else platform_name
+    current_version = sys.version_info if version_info is None else version_info
+    win32_version = platform.win32_ver() if windows_version is None else windows_version
+    current_machine = platform.machine() if machine is None else machine
+    current_max_size = sys.maxsize if max_size is None else max_size
+    release, version, service_pack = win32_version[:3]
+    is_win7 = str(release) == "7" or str(version).startswith("6.1")
+    is_sp1 = "SP1" in str(service_pack).upper() or str(version).startswith("6.1.7601")
+    is_x64 = str(current_machine).casefold() in ("amd64", "x86_64") and current_max_size > 2**32
+    return (
+        current_platform == "win32"
+        and tuple(current_version[:3]) == (3, 8, 10)
+        and is_win7
+        and is_sp1
+        and is_x64
+    )
+
+
+def _is_explicit_cross_build_test_environment(
+    environ=None,
+    platform_name=None,
+    version_info=None,
+    machine=None,
+    max_size=None,
+):
+    """Allow sealed Win11 packaging tests only behind the explicit build flag."""
+
+    environment = os.environ if environ is None else environ
+    if environment.get("PERFORMANCE_ALLOW_WIN11_CROSS_BUILD") != "1":
+        return False
+    if environment.get("CONDA_PREFIX") or environment.get("CONDA_DEFAULT_ENV"):
+        return False
+    current_platform = sys.platform if platform_name is None else platform_name
+    current_version = sys.version_info if version_info is None else version_info
+    current_machine = platform.machine() if machine is None else machine
+    current_max_size = sys.maxsize if max_size is None else max_size
+    return (
+        current_platform == "win32"
+        and tuple(current_version[:3]) == (3, 8, 10)
+        and str(current_machine).casefold() in ("amd64", "x86_64")
+        and current_max_size > 2**32
+    )
+
+
 def _in_expected_environment():
     active_name = str(os.environ.get("CONDA_DEFAULT_ENV", ""))
-    return (
+    in_development_environment = (
         active_name.casefold() == ENVIRONMENT_NAME.casefold()
         or Path(sys.prefix).name.casefold() == ENVIRONMENT_NAME.casefold()
+    )
+    return (
+        in_development_environment
+        or _is_win7_release_test_environment()
+        or _is_explicit_cross_build_test_environment()
     )
 
 
@@ -114,8 +177,11 @@ def main(argv=None):
 
     if not _in_expected_environment():
         print(
-            "This project must be tested in the '{}' Conda environment.\n"
-            "Run run_tests.bat, or use:\n"
+            "Tests require either the '{}' Conda development environment, or "
+            "the fixed Win7 SP1 x64 Python.org 3.8.10 release environment. "
+            "An explicit sealed Win11 cross-build may also use Python.org "
+            "3.8.10.\n"
+            "For development, run run_tests.bat, or use:\n"
             "  conda run --no-capture-output -n {} python run_tests.py".format(
                 ENVIRONMENT_NAME, ENVIRONMENT_NAME
             ),

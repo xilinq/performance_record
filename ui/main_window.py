@@ -342,6 +342,7 @@ class MainWindow(QMainWindow):
         self.data_entry_tab.set_to_latest_period()
         self.data_entry_tab.load_period_data()
         self.data_entry_tab.refresh_name_combos()
+        self.data_entry_tab.refresh_position_combos()
         self.data_entry_tab.refresh_person_list(preserve_current=False)
         self.data_entry_tab.load_person_data()
         self.charts_tab.populate_filters()
@@ -419,7 +420,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self,
             "关于业绩追踪系统",
-            "业绩追踪系统 v1.3.0\n\n"
+            "业绩追踪系统 v1.3.1\n\n"
             "支持按时期和人员维护业绩、自动计算增长率、图表分析以及纯数据 CSV 备份。\n\n"
             "兼容目标：Windows 7 SP1 64 位及更高版本。",
         )
